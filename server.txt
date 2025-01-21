@@ -1,0 +1,3201 @@
+//require all node js modules for server side
+require("events").EventEmitter.prototype._maxListeners = 10000;
+fs = require("fs");
+
+const security_options = {
+  // use the server key
+  key: fs.readFileSync("./security/key.pem"),
+
+  // use the server cert
+  cert: fs.readFileSync("./security/cert.pem"),
+
+  // enforce client certs
+  //  requestCert: true,
+  // rejectUnauthorized: false,
+
+  // add client cert as part of the certificate authority
+  ca: [fs.readFileSync("./security/ca-crt.pem")],
+};
+
+
+var express = require("express"),
+  fmServer,
+  app = express(),
+  server = require("https").createServer(security_options, app);//,//server module for creating server
+
+const io = require("socket.io")(server,
+  {
+    serverClient: false,
+    pingInterval: 10000,
+    pingTimeout: 5000,
+    cookie: false,
+    wsEngine: "ws"
+  });
+
+
+ent = require("ent"), // Blocks HTML characters (security equivalent to htmlentities in PHP)
+fs = require("fs");   //a file system module
+path = require("path");
+mustache = require("mustache");
+bodyParser = require("body-parser");
+crypto = require("crypto"); //used for password encryption
+multer = require("multer");
+SelfReloadJSON = require("self-reload-json"); //used if json file modifies
+session = require("express-session");
+Stopwatch = require("timer-stopwatch");
+auth = require("./Minerva_modules/auth");
+floor = require("math-floor");
+FileStore = require("session-file-store")(session);
+winston = require("winston");
+isDirectory = require("is-directory");
+packageJson = require("./package.json");
+powerManager = require("./Minerva_modules/powerManager");
+canRelay = require("./Minerva_modules/canRelay");
+versionSort = require("./Minerva_modules/version_sort");
+randomString = require("randomstring");
+configFileVerify = require("./public/js/configFileVerify.js");
+settings = require("./routes/settings/settings"); //post and get request from seeting
+socketSettings = require("./routes/settings/socketSettings"); //socket from settings
+fileManagerTempFileRemoval = require("./file_manager/public/js/deleteFilesOnRelease.js");
+yauzl = require('yauzl');
+
+//manage account page
+var mustacheSettingsPage = fs.readFileSync(__dirname + "/public/views/settings.mst", "utf8");
+//client page is the page in which projects are displayed
+var mustacheaddNewConfig = fs.readFileSync(__dirname + "/public/views/addNewConfig.mst", "utf8");
+//client page is the page in which projects are displayed
+var mustacheTemplateClientPage = fs.readFileSync(__dirname + "/public/views/clientPage.mst", "utf8");
+//project is the page with ssh,serial and vnc of the specific project
+var mustacheTemplateProjectPage = fs.readFileSync(__dirname + "/public/views/project.mst", "utf8");
+//quickupdate.mst is used if you want to see the full webswing quickupdateApp app in a new tab
+var mustacheTemplateWebswingtemplatePage = fs.readFileSync(__dirname + "/public/views/webswingTemplate.mst", "utf8");
+//fileManager.mst is used to open a file manager page
+var mustacheTemplateFileManagerPage = fs.readFileSync(__dirname + "/public/views/fileManager.mst", "utf8");
+//file where last branches of projects are stored
+var branchesConfigFile = new SelfReloadJSON(__dirname + "/public/config/cached/config_branches.json");
+//config file stores all data about ports for ssh,serial,vnc,fileManager keyPath
+var configProjectFile = ""
+// TODO: shitty init, please refactor
+
+async function checkZipForFile(zipFilePath, socket) {
+  return new Promise((resolve, reject) => {
+    yauzl.open(zipFilePath, { lazyEntries: true }, (err, zipfile) => {
+      if (err) return reject(err);
+      
+      zipfile.readEntry();
+      
+      zipfile.on('entry', entry => {
+        if (entry.fileName === "rawprogram_nand_p4K_b256K.xml") {
+          console.log("File rawprogram_nand_p4K_b256K.xml found in the zip archive.");
+          socket.emit("updateMessage", { message: "File rawprogram_nand_p4K_b256K.xml found in the zip archive.\n" });
+          zipfile.close();
+          resolve("nad");
+        } else if (entry.fileName === "uuu.auto") {
+          console.log("File uuu.auto found in the zip archive.");
+          socket.emit("updateMessage", { message: "File uuu.auto found in the zip archive.\n" });
+          zipfile.close();
+          resolve("imx");
+        } else {
+          zipfile.readEntry();
+        }
+      });
+    
+      zipfile.on('end', () => {
+        console.log("rawprogram_nand_p4K_b256K.xml or uuu.auto was not found in the zip archive, aborting flash...");
+        socket.emit("updateMessage", { message: "rawprogram_nand_p4K_b256K.xml or uuu.auto was not found in the zip archive, aborting flash...\n" });
+        zipfile.close();
+        resolve("custom");
+      });
+    });
+  });
+}
+
+function initializeConfigFile() {
+
+  if (!fs.existsSync(__dirname + "/public/config/persistent/config.json")) {
+    console.log("configProjectFile: " + configProjectFile + " does not exist, copying the template one in place.");
+    fs.writeFileSync(__dirname + "/public/config/persistent/config.json", fs.readFileSync(__dirname + "/public/config/template/config.json"));
+    //TODO: add error handling here
+  }
+  else {
+    configFileVerify.createConfigBackupFile(__dirname);
+    configProjectFile = new SelfReloadJSON(__dirname + "/public/config/persistent/config.json");
+  }
+
+  console.log("Initializing config file with given environment variables");
+
+  // initializing the RELAY_SERIAL_PORT
+  if (!process.env.RELAY_DEVICE_NAME) {
+    throw new Error("initConfigFile: RELAY_SERIAL_PORT was not defined!");
+  } else {
+    console.log("Using RELAY_DEVICE_NAME: " + process.env.RELAY_DEVICE_NAME);
+    configProjectFile.serverConfig.relaySerialPort = process.env.RELAY_DEVICE_NAME;
+  }
+
+  // initializing the RELAY_SERIAL_PORT
+  if (!process.env.MINERVA_IP) {
+    throw new Error("initConfigFile: MINERVA_IP was not defined!");
+  } else {
+    console.log("Using MINERVA_IP: " + process.env.MINERVA_IP);
+    configProjectFile.serverConfig.IP_Address = process.env.MINERVA_IP;
+  }
+
+  console.log("Initializing config file DONE!");
+}
+
+initializeConfigFile();
+
+var timeForProjConfig = new SelfReloadJSON(__dirname + "/public/config/cached/timeForProj.json");
+var killRelayApp = require("child_process").exec("killAllRelayApp.sh");
+killRelayApp.stdout.on("data", function (data) {
+  console.log("killRelayApp:" + data.toString());
+});
+
+//webswing.config contains the configurations for the running java applications for each project
+var webswingConfigFile = configFileVerify.getWebswing(__dirname);
+
+//child process that starts jar file for the relay board
+powerManager.createChildProcess("external/Relay/RelayApp.jar", configProjectFile.serverConfig.relaySerialPort, io);
+setTimeout(function () {
+  powerManager.OpenAllRelays();
+}, 3000);
+
+//for startign the webswing when the server starts
+var childWebswing = require("child_process").spawn("./external/webswing-2.4/webswing.sh", ["restart"]);
+
+//process for sending mails before releasing devices
+var sendMail;
+
+//variables which will hold the result of a command execution(ex PID)
+var serialChildExec1;
+var serialChildExec2;
+var sshChildExec;
+var vncChildExec;
+
+var timeForProject = {};
+var timeProject = {};
+var loggedInUsers = {};
+var userAdmin = {};
+var socketForProject = new Array();
+var sessions = {};
+var projectIndices = {};
+var quickUpdateSuccessful = {};
+var timeWarning = {};
+var warnUser = {};
+var quickUpdateMessage = {};
+var runTimer = {};
+var timeElapsed = {};
+var totalElapsedTime = {};
+var timeFinished = {};
+var brokenDevice = {}; // value is 0 for device if device is not broken. If device has quickUpdate problems this variable will become 1 and if user reports a problem this will become 2
+var adminList = [];
+var reportProblemMail = [];
+var generatedPorts = [];
+
+var JAVA_APPL_TYPES_FOR_EACH_PROJECT = 3;
+
+var sess_options = {
+  path: "./public/sessions",
+  ttl: 3 * 24 * 3600,
+  reapInterval: 600,
+  retries: 1
+};
+
+//app.engine("html",require("ejs").renderFile);
+//put inside the static folder the css, javascript and html files  that are loaded statically
+//app.use(express.static(__dirname));
+app.use(express.static(__dirname + "/public/"));
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: false }));
+
+app.use(session({
+  store: new FileStore(sess_options),
+  secret: "myserver1234",
+  resave: false,
+  saveUninitialized: true,
+}));
+
+//user name taken from the env variables
+const userName = process.env.LINUX_USERNAME
+
+//the path to the project keys
+const projectsKeyPath = "/home/" + userName + "/leap/leap/system/security/";
+
+//the path to the projects in system
+const projectsPath = "/home/" + userName + "/leap/leap/system/release/";
+
+//path of the script to get the used USB ports
+const deviceConnectionScript = "public/scripts/getConnectedDevices.sh";
+
+//path to passwords file for users
+const passwordFile = "auth/remote_passw";
+
+let loginFile = new SelfReloadJSON(passwordFile);
+
+var options = {
+  refreshRateMS: 10000
+};
+var timerProj = new Array();
+
+var logger = new (winston.Logger)({
+  level: "debug",
+  transports: [
+    // setup logging to file
+    new (winston.transports.File)({
+      filename: "./log/minerva.log",
+      maxsize: 1024 * 1024 * 15, // 15MB
+      level: "info",
+      maxFiles: "100",
+      "timestamp": function () {
+        var date = new Date()
+        var year = date.getFullYear();
+        var month = date.getMonth() + 1;
+        var day = date.getDate();
+        var hour = date.getHours();
+        var minutes = date.getMinutes();
+        var seconds = date.getSeconds();
+        var milliseconds = date.getMilliseconds();
+        return '[' + ((day < 10) ? '0' + day : day) +
+          '/' +
+          ((month < 10) ? '0' + month : month) +
+          '/' +
+          year +
+          "  " +
+          ((hour < 10) ? '0' + hour : hour) +
+          ':' +
+          ((minutes < 10) ? '0' + minutes : minutes) +
+          ':' +
+          ((seconds < 10) ? '0' + seconds : seconds) + "] ";
+      }
+    })
+  ]
+});
+
+updateWebswingConfig();
+makeAdminList();
+
+var log = console.log;
+console.log = function () {
+  var first_parameter = arguments[0];
+  var other_parameters = Array.prototype.slice.call(arguments, 1);
+
+  function formatConsoleDate(date) {
+    var year = date.getFullYear();
+    var month = date.getMonth() + 1;
+    var day = date.getDate();
+    var hour = date.getHours();
+    var minutes = date.getMinutes();
+    var seconds = date.getSeconds();
+    var milliseconds = date.getMilliseconds();
+    return '[' + ((day < 10) ? '0' + day : day) +
+      '/' +
+      ((month < 10) ? '0' + month : month) +
+      '/' +
+      year +
+      "  " +
+      ((hour < 10) ? '0' + hour : hour) +
+      ':' +
+      ((minutes < 10) ? '0' + minutes : minutes) +
+      ':' +
+      ((seconds < 10) ? '0' + seconds : seconds) + "] ";
+  }
+
+  log.apply(console, [formatConsoleDate(new Date()) + first_parameter].concat(other_parameters));
+  logger.log("info", [formatConsoleDate(new Date()) + first_parameter].concat(other_parameters));
+};
+
+
+var myPrjName = {};
+var myDeviceIP = {};
+var userForDevice = {};
+var userDownloadFile = {};
+var userDownloadFileSecond = {};
+
+function createSerialLogsPath(username, prjName, deviceIP, projID) {
+  var projectIndex = findProject(projID);
+  var path = "userSpace";
+  if (!fs.existsSync(path)) {
+    fs.mkdirSync(path);
+  }
+  fs.chmod(path, "777", function (err) {
+    if (err)
+      return console.log(err);
+  });
+
+  if (!fs.existsSync(path + '/' + username.toString())) {
+    fs.mkdirSync(path + '/' + username.toString());
+  }
+
+  fs.chmod(path + '/' + username.toString(), "777", function (err) {
+    if (err)
+      return console.log(err);
+  });
+
+  if (!fs.existsSync(path + '/' + username.toString() + '/' + prjName.toString())) {
+    fs.mkdirSync(path + '/' + username.toString() + '/' + prjName.toString());
+  }
+  fs.chmod(path + '/' + username.toString() + '/' + prjName.toString(), "777", function (err) {
+    if (err)
+      return console.log(err);
+  });
+
+  if (!fs.existsSync(path + '/' + username.toString() + '/' + prjName.toString() + '/' + deviceIP.toString())) {
+    fs.mkdirSync(path + '/' + username.toString() + '/' + prjName.toString() + '/' + deviceIP.toString());
+  }
+  fs.chmod(path + '/' + username.toString() + '/' + prjName.toString() + '/' + deviceIP.toString(), "777", function (err) {
+    if (err)
+      return console.log(err);
+  });
+
+  if (!fs.existsSync(path + '/' + username.toString() + '/' + prjName.toString() + '/' + deviceIP.toString() + "/images/")) {
+    fs.mkdirSync(path + '/' + username.toString() + '/' + prjName.toString() + '/' + deviceIP.toString() + "/images/");
+  }
+  fs.chmod(path + '/' + username.toString() + '/' + prjName.toString() + '/' + deviceIP.toString() + "/images/", "777", function (err) {
+    if (err)
+      return console.log(err);
+  });
+
+  if (!fs.existsSync(path + '/' + username.toString() + '/' + prjName.toString() + '/' + deviceIP.toString() + "/firstSerial/")) {
+    fs.mkdirSync(path + '/' + username.toString() + '/' + prjName.toString() + '/' + deviceIP.toString() + "/firstSerial/");
+  }
+  fs.chmod(path + '/' + username.toString() + '/' + prjName.toString() + '/' + deviceIP.toString() + "/firstSerial/", "777", function (err) {
+    if (err)
+      return console.log(err);
+  });
+
+  if (!fs.existsSync(path + '/' + username.toString() + '/' + prjName.toString() + '/' + deviceIP.toString() + "/secondSerial/")) {
+    fs.mkdirSync(path + '/' + username.toString() + '/' + prjName.toString() + '/' + deviceIP.toString() + "/secondSerial/");
+  }
+  fs.chmod(path + '/' + username.toString() + '/' + prjName.toString() + '/' + deviceIP.toString() + "/secondSerial/", "777", function (err) {
+    if (err)
+      return console.log(err);
+  });
+
+  if (!fs.existsSync("userSpace/" + username + '/' + prjName + '/' + deviceIP + "/firstSerial/" + "loggingOption.txt")) {
+    fs.writeFile("userSpace/" + username + '/' + prjName + '/' + deviceIP + "/firstSerial/" + "loggingOption.txt", '0', function (err) {
+      if (err) throw err;
+      console.log("Saved!");
+    });
+  }
+
+  if (!fs.existsSync("userSpace/" + username + '/' + prjName + '/' + deviceIP + "/secondSerial/" + "loggingOption.txt")) {
+    fs.writeFile("userSpace/" + username + '/' + prjName + '/' + deviceIP + "/secondSerial/" + "loggingOption.txt", '0', function (err) {
+      if (err) throw err;
+      console.log("Saved!");
+    });
+  }
+
+  if (!fs.existsSync("userSpace/" + username + '/' + prjName + '/' + deviceIP + "/firstSerial/" + "userSerialDownload.json")) {
+    fs.writeFileSync("userSpace/" + username + '/' + prjName + '/' + deviceIP + "/firstSerial/" + "userSerialDownload.json", '{ "numberOfMBtoDownload":0,\n"lastDownloadedFileIndex":1,\n"userNotified":false}', function (err) {
+      if (err) throw err;
+      console.log("Saved!");
+    });
+  }
+  else {
+    var stats = fs.statSync("userSpace/" + username + '/' + prjName + '/' + deviceIP + "/firstSerial/" + "userSerialDownload.json");
+    var fileSizeInBytes = stats["size"];
+    if (fileSizeInBytes === 0) {
+      fs.writeFileSync("userSpace/" + username + '/' + prjName + '/' + deviceIP + "/firstSerial/" + "userSerialDownload.json", '{ "numberOfMBtoDownload":0,\n"lastDownloadedFileIndex":1,\n"userNotified":false}', function (err) {
+        if (err) throw err;
+        console.log("Saved!");
+      });
+    }
+  }
+
+  userDownloadFile[projectIndex] = new SelfReloadJSON("userSpace/" + username + '/' + prjName + '/' + deviceIP + "/firstSerial/" + "userSerialDownload.json");
+
+  if (!fs.existsSync("userSpace/" + username + '/' + prjName + '/' + deviceIP + "/secondSerial/" + "userSerialDownload.json")) {
+    fs.writeFileSync("userSpace/" + username + '/' + prjName + '/' + deviceIP + "/secondSerial/" + "userSerialDownload.json", '{ "numberOfMBtoDownload":0,\n"lastDownloadedFileIndex":1,\n"userNotified":false}', function (err) {
+      if (err) throw err;
+      console.log("Saved!");
+    });
+  }
+  else {
+    var stats = fs.statSync("userSpace/" + username + '/' + prjName + '/' + deviceIP + "/secondSerial/" + "userSerialDownload.json");
+    var fileSizeInBytes = stats["size"];
+    if (fileSizeInBytes === 0) {
+      fs.writeFileSync("userSpace/" + username + '/' + prjName + '/' + deviceIP + "/secondSerial/" + "userSerialDownload.json", '{ "numberOfMBtoDownload":0,\n"lastDownloadedFileIndex":1,\n"userNotified":false}', function (err) {
+        if (err) throw err;
+        console.log("Saved!");
+      });
+    }
+  }
+
+  userDownloadFileSecond[projectIndex] = new SelfReloadJSON("userSpace/" + username + '/' + prjName + '/' + deviceIP + "/secondSerial/" + "userSerialDownload.json");
+}
+
+function deleteUserFiles(username, projName, ipAddress){
+  console.log("deleting user logs");
+  dirToBeRemoved = "userSpace/" + username + '/' + projName + '/' + ipAddress;
+  fs.rmdir(dirToBeRemoved, { recursive: true }, err => {
+    if (err) {
+      throw err
+    }
+    console.log("User space for device removed with success!");
+  })
+}
+
+//function that starts 3 shellinabox on a page with ssh,serial,vnc
+function startRequiredInterfaces(username, projID, prjName, deviceIP, ethAdapterPort, sshPort, serialPort1, serialPort2, serialDevice1, serialDevice2, vncPort, keyPath, serialLogSize) {
+  var serialChild1 = require("child_process");
+  var serialChild2 = require("child_process");
+
+  var sshChild = require("child_process");
+
+  var vncChild = require("child_process");
+
+  var execCommandSerial1;
+  var execCommandSerial2;
+  var execCommandSSH;
+  var execCommandVNC;
+  //kill process on certain port
+  killProcessOnPort(serialPort1);
+  killProcessOnPort(serialPort2);
+  killProcessOnPort(sshPort);
+  killProcessOnPort(vncPort);
+
+  myPrjName[projID] = prjName;
+  myDeviceIP[projID] = deviceIP;
+  userForDevice[projID] = username;
+  serialLogSize[projID] = serialLogSize;
+
+  createSerialLogsPath(username, prjName, deviceIP, projID);
+
+  execCommandSerial1 = "sudo shellinaboxd --cert " + __dirname + "/security --css public/css/white-on-black.css -p " + serialPort1 + ' --service /:$USER:$GROUP:$PWD:"node external/serialport/serialport-terminal.js -p ' + serialDevice1 + " -v serial1 -b 115200" + " -u " + username + " -r " + prjName + " -i " + deviceIP + " -s " + serialLogSize + '"';
+  execCommandSerial2 = "sudo shellinaboxd --cert " + __dirname + "/security --css public/css/white-on-black.css -p " + serialPort2 + ' --service /:$USER:$GROUP:$PWD:"node external/serialport/serialport-terminal.js -p ' + serialDevice2 + " -v serial2 -b 115200" + " -u " + username + " -r " + prjName + " -i " + deviceIP + " -s " + serialLogSize + '"';
+
+  serialChildExec1 = serialChild1.exec(execCommandSerial1,
+    function (error, stdout, stderr) {
+      if (error != null) {
+        //console.log("exec error in serialChild1" + error);
+        console.log("Serial1 shellbox is probably already running!");
+      }
+    });
+
+  serialChildExec2 = serialChild2.exec(execCommandSerial2,
+    function (error, stdout, stderr) {
+      if (error != null) {
+        //console.log("exec error in serialChild2" + error);
+        console.log("Serial2 shellbox is probably already running!");
+      }
+    });
+
+  console.log("KeyPath:" + keyPath);
+  console.log("IP:" + deviceIP);
+  if (ethAdapterPort)
+    enterNamespace = "sudo ip netns exec ns" + ethAdapterPort + " "
+  else
+    enterNamespace = ""
+  execCommandSSH = "sudo shellinaboxd --cert " + __dirname + "/security --css public/css/white-on-black.css -p " + sshPort + ' --service /:$USER:$GROUP:$PWD:"' + enterNamespace + 'node external/SSH/SSHConnection.js -h ' + deviceIP + " -u root -c null -k " + keyPath + '"';
+  sshChildExec = sshChild.exec(execCommandSSH,
+    function (error, stdout, stderr) {
+      if (error != null) {
+        //console.log('exec error in sshChild' + error);
+        console.log("SSH shellbox is probably already running!");
+      }
+    });
+
+  console.log("DEV IP FOR VNC = " + deviceIP);
+  execCommandVNC = "./external/noVNC/utils/launch.sh --vnc " + deviceIP + ":5900 --listen " + vncPort + " --cert " + __dirname + "/security/certificate.pem";
+  vncChildExec = vncChild.exec(execCommandVNC,
+    function (error, stdout, stderr) {
+      if (error != null) {
+        //console.log('exec error in vnc Child' + error);
+        console.log("VNC box is probably already running!");
+      }
+    });
+}
+
+//function for finding the specific project in the config file and getting the configuration for the project
+function loadProjectPage(projID, prjName, username, done) {
+  var projectIndex = findProject(projID);
+  //se apeleaza functia care deschide interfetele
+  startRequiredInterfaces(
+    username,
+    projID,
+    prjName,
+    configProjectFile.config[projectIndex].deviceIPAddr,
+    configProjectFile.config[projectIndex].ethAdapterPort,
+    configProjectFile.config[projectIndex].SHHFWonPort,
+    configProjectFile.config[projectIndex].serialFWonPort1,
+    configProjectFile.config[projectIndex].serialFWonPort2,
+    configProjectFile.config[projectIndex].serialConnection1,
+    configProjectFile.config[projectIndex].serialConnection2,
+    configProjectFile.config[projectIndex].VNCFWPort,
+    configProjectFile.config[projectIndex].keyPath,
+    configProjectFile.genericProjectConfig.serialLogSize
+  );
+
+  var fileManagerPort = configProjectFile.config[projectIndex].FileManagerPort;
+  var userJson = { "username": username };
+  var minervaVersion = { "version": packageJson.version };
+  var JsonFile = extend({}, configProjectFile.config[projectIndex], configProjectFile.serverConfig, minervaVersion, userJson);
+  var html = mustache.to_html(mustacheTemplateProjectPage, JsonFile);
+  return done(html);
+}
+
+//get for login page
+app.get('/', function (req, res) {
+  if (req.session.username) {
+    //if user is connected redirect to showProj
+    res.redirect("/showProj");
+  }
+  else {
+    //else go to login page
+    res.sendFile(__dirname + "/public/views/index.html");
+  }
+});
+
+var storage = multer.diskStorage({
+  destination: function (req, file, callback) {
+    projectID = req.headers.referer.split("projID=")[1].split('&')[0];
+    projectIndex = findProject(projectID);
+    const dir = __dirname + "/userSpace/" + configProjectFile.config[projectIndex].LockedBy + '/' + configProjectFile.config[projectIndex].projName + '/' + configProjectFile.config[projectIndex].deviceIPAddr + "/images/";
+
+    fs.exists(dir, exist => {
+      if (!exist) {
+        return fs.mkdir(dir, error => callback(null, dir))
+      }
+      return callback(null, dir)
+    })
+  },
+  filename: function (req, file, callback) {
+    callback(null, file.originalname.replace(/\s|\(|\)/g, '.'))
+  }
+});
+
+var upload = multer({ storage: storage });
+
+app.post("/uploadFile", upload.any(), function (req, res) {
+  res.setTimeout(30 * 60 * 1000, function () {
+    console.log("Upload Response Timeout");
+  });
+  res.redirect(req.headers.referer);
+});
+
+//post request for login
+app.post("/login", function (req, res) {
+  var loginUsersFile = new SelfReloadJSON(passwordFile);
+  var hash = crypto.createHash("sha256").update(req.body.password).digest("hex");
+
+  //checkLogin from auth module
+  var message = auth.checkLogin(req.body.username, hash, loginUsersFile);
+  console.log(message);
+
+  switch (message) {
+    case "AUTH_USER":
+      while (!req.session.username) {
+        req.session.username = req.body.username;
+        sleep(200);
+      }
+      //setTimeout(function(){res.redirect("/showProj");},500);
+
+      res.redirect("/?message=AUTH_USER");
+      break;
+
+    case "INCORRECT_PASSWORD":
+      res.redirect("/?message=INCORRECT_PASSWORD");
+      break;
+
+    case "NOT_AUTHORIZED":
+      res.redirect("/?message=NOT_AUTHORIZED");
+      break;
+    default:
+      res.redirect('/');
+      break;
+  }
+  //sends message to index.html page in order to
+  //know which page to open
+  //it sends a message (AUTH_CORRECT,INCORRECT_PASSWORD,NOT_AUTHORIZED,USER_LOGGED)
+  //res.end(message);
+});
+
+//get request for logout
+app.get("/logout", function (req, res) {
+
+  if (req.session.username) {
+    //puts the users[username] on false from auth
+    auth.logout(req.session.username);
+    //gets the list of all users that have been logged in
+    //if variable is true => user is logged
+    //else user is not logged
+    loggedInUsers = auth.getLoggedInUsers();
+    //sends message to all active pages
+    //makes pages send message of check to server in order to see if they are logged in
+    io.sockets.emit("clientMessageFromServer", { message: "logoutUser", username: req.session.username });
+    io.sockets.emit("projectMessageFromServer", { message: "logoutUser", username: req.session.username });
+    io.sockets.emit("addNewConfigMessageFromServer", { message: "logoutUser", username: req.session.username });
+    io.sockets.emit("setAccountMessageFromServer", { message: "logoutUser", username: req.session.username })
+    //destroy this session
+    req.session.destroy(function (err) {
+      res.redirect('/');
+    });
+  }
+  else {
+    res.redirect('/');
+  }
+});
+
+//request of get on showProj
+app.get("/showProj", function (req, res) {
+  //if session is valid
+  //HERE send in JsonFile firstLogin parameter
+  if (req.session.username) {
+    var loginUsersFile = new SelfReloadJSON(passwordFile);
+    userAdmin[req.session.username] = auth.checkAdmin(req.session.username, loginUsersFile);
+    //user could have logout from a different browser so it must
+    //let the auth module that this user is still active in a different browser
+    auth.checkUser(req.session.username);
+    var userJson = { "username": req.session.username };
+    var minervaVersion = { "version": packageJson.version };
+    var i;
+    for (i = 0; i < loginFile.users.length; i++) {
+      if (loginFile.users[i].user === req.session.username) {
+        break;
+      }
+    }
+    var firstLogin = { "firstLogin": loginFile.users[i].firstLogin };
+    var JsonFile = extend({}, configProjectFile, configProjectFile.serverConfig, minervaVersion, userJson, firstLogin);
+    if (loginFile.users[i].firstLogin === true) {
+      console.log("First login");
+    }
+    //convert mustache template to html
+    var html = mustache.to_html(mustacheTemplateClientPage, JsonFile);
+    res.send(html);
+  }
+  else {
+    //if session is not valid redirect to login page
+    res.redirect('/');
+    //res.sendFile(__dirname + "/public/views/index.html");
+  }
+});
+
+//post request from clientPage.mst
+//this allows you to open project page only if you have selected time and clicke ok from clientPage
+app.post("/verifyProject", function (req, res) {
+  req.accepts(["json", "text"]);
+  var projectIndex = findProject(req.body.projID);
+  if (req.session.username) {
+    //if Locked is 1 => project is Locked by someone
+    var Locked = verifyProjectLocked(req.body.projID, req.body.proj, req.session.username, req.body.timeProj, projectIndex);
+
+    if (Locked === 0) //if you don't want to count seconds for every project, don't erase this variable
+    {
+      //this variable is used in order to not let users acces project page,unless they selected time first
+      //from the clientPage
+      //this variable is used in the project Get Request
+      if (req.body.brokenDevice === "true") {
+        configProjectFile.config[projectIndex].LockedBy = req.session.username + ",BROKEN-DEVICE";
+      }
+      else {
+        configProjectFile.config[projectIndex].LockedBy = req.session.username;
+      }
+
+      configProjectFile.config[projectIndex].LockedFor = req.body.timeProj; //new code
+      configProjectFile.config[projectIndex].Session = req.body.sessionFromPost; // new code
+      //send data of new user of project to clientPage
+      io.sockets.emit("clientMessageFromServer", {
+        message: "clientLockedDevice",
+        projName: req.body.proj,
+        projID: req.body.projID,
+        lockedBy: configProjectFile.config[projectIndex].LockedBy,
+      });
+      if (quickUpdateSuccessful[projectIndex] != false) {
+        quickUpdateSuccessful[projectIndex] = true;
+      }
+      //console.log("QuickUpdateSuccessful:"+quickUpdateSuccessful[projectIndex]);
+      saveConfigFile();
+      io.sockets.emit("addNewConfigMessageFromServer", { message: "reloadPage" });
+      res.end("NOT_LOCKED");
+    }
+  }
+  else {
+    res.end("RELOAD");
+  }
+});
+
+//it will run every time when server.js is executed
+//TO DO check this function for LockedBy
+function updateAfterFail() {
+  let userName;
+  for (let i = 0; i < configProjectFile.config.length; i++) {
+    var lockedBy = splitLockedBy(configProjectFile.config[i].LockedBy);
+    //configProjectFile.config[i].LockedFor is set on 0 when a clean exit is executed or after a quickUPDATE, in any other situations that variable is the number of seconds
+    if (configProjectFile.config[i].LockedFor != "0" && lockedBy != "" && lockedBy != "QuickUpdate") {
+      userName = configProjectFile.config[i].LockedBy;// saving the user in userName and setting lockedby="", because otherwise we can't enter in if and restore the sessions/quickupdate
+      configProjectFile.config[i].LockedBy = "";
+      saveConfigFile();
+      if (verifyProjectLocked(
+        configProjectFile.config[i].projID,
+        configProjectFile.config[i].projName,
+        userName,
+        configProjectFile.config[i].LockedFor,
+        i
+      ) == 0) {
+        configProjectFile.config[i].LockedBy = userName;
+        saveConfigFile();
+        io.sockets.emit("clientMessageFromServer", {
+          message: "clientLockedDevice",
+          projName: configProjectFile.config[i].projName,
+          projID: configProjectFile.config[i].projID,
+          username: configProjectFile.config[i].LockedBy
+        });
+        if (quickUpdateSuccessful[i] != false) {
+          quickUpdateSuccessful[i] = true;
+        }
+        saveConfigFile();
+        io.sockets.emit("addNewConfigMessageFromServer", { message: "reloadPage" });
+      }
+    }
+    if (configProjectFile.config[i].LockedBy == "QuickUpdate") {
+      userName = configProjectFile.config[i].LockedBy;
+      configProjectFile.config[i].LockedBy = "";
+      saveConfigFile();
+      if (verifyProjectLocked(
+        configProjectFile.config[i].projID,
+        configProjectFile.config[i].projName,
+        configProjectFile.config[i].LockedBy,
+        configProjectFile.config[i].QuickUpdateTime,
+        i
+      ) == 0) {
+        configProjectFile.config[i].LockedBy = userName;
+        saveConfigFile();
+        startUpdate(configProjectFile.config[i].projID, "QuickUpdate");
+      }
+    }
+  }
+}
+
+function startUpdate(projID, username) {
+  var projectIndex;
+  for (let k = 0; k < configProjectFile.config.length; k++) {
+    if (configProjectFile.config[k].projID == projID) {
+      projectIndex = k;
+    }
+  }
+  var projectName = configProjectFile.config[projectIndex].projName;
+  var releaseVersion = getProjectReleaseVersions(projectName);
+  var ip_actual = configProjectFile.config[projectIndex].deviceIPAddr;
+  var cale = projectsPath + projectName + "/" + releaseVersion[0].toString();
+  if (projectName == "pcm3") {
+    var patch_file = cale.toString() + "/build/uuu-flash-spinor-emmc.zip";
+  }
+  else if (projectName == "hw8") {
+    var patch_file = cale.toString() + "/hw8/build";
+  }
+  else {
+    var patch_file = cale.toString() + "/delivery/update/" + projectName + "_" + releaseVersion[0].toString() + "_quickupdatePatch";
+  }
+  
+  console.log("IP:", ip_actual);
+  console.log("Patch File:", patch_file);
+  
+
+  quickUpdateMessage[projectIndex] = "";
+  quickUpdateSuccessful[projectIndex] = false;
+  var childProcess = powerManager.getRelayAppProcess();
+  let powerPort = configProjectFile.config[projectIndex].relayBoardTRM30ID;
+  let ignitionPort = configProjectFile.config[projectIndex].relayBoardTRM15ID;
+  let modeSwitchPort = configProjectFile.config[projectIndex].modeSwitchPort;
+  let flashPort = configProjectFile.config[projectIndex].flashPort;
+  let adbPort = configProjectFile.config[projectIndex].adbPort;
+  let adbServerPort = configProjectFile.config[projectIndex].adbServerPort;
+  let serialPath = configProjectFile.config[projectIndex].serialConnection1;
+  let serialNumber = configProjectFile.config[projectIndex].serialNumber;
+  let workDir = "userSpace/" + configProjectFile.config[projectIndex].LockedBy + '/' + projectName + '/' + ip_actual + "/images"
+
+  if (projectName == "hw8") {
+    //NAD UPDATE
+    powerManager.TRMRelay_OFF(powerPort, childProcess);
+    powerManager.TRMRelay_OFF(ignitionPort, childProcess);
+    powerManager.TRMRelay_OFF(modeSwitchPort, childProcess);
+    powerManager.TRMRelay_ON(powerPort, childProcess);
+    powerManager.TRMRelay_ON(ignitionPort, childProcess);
+
+    console.log("Attempting to flash");
+    let lastSentData = "";
+    let flashSuccess = false;
+    childFlash = require("child_process").spawn("./public/scripts/uuuFlash.sh", ["public/traton_imx_images/FlashLinuxAndStartNadDownloadMode.zip", flashPort]);
+    childFlash.stdout.on("data", function (data) {
+      let output = data.toString().replace(/[^a-z0-9!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?\n ]|\[1F|\[93m|\[92m|\[0m|\[\?25l|/gi, '').slice(0, 200).trim();
+      if (output.slice(-1) != '\n')
+        output += '\n';
+      if (output != lastSentData && output.length > 1)
+        quickUpdateMessage[projectIndex] += output;
+      lastSentData = output;
+      if (data.toString().includes("Flashing successfully done")) {
+        flashSuccess = true;
+      }
+    });
+    childFlash.on("exit", function () {
+      powerManager.TRMRelay_ON(modeSwitchPort, childProcess);
+      if (flashSuccess) {
+          console.log("Passthrough flash success");
+          console.log("Attempting to flash NAD");
+          let lastSentData = "";
+          let flashNADSuccess = false;
+          childFlashNAD = require("child_process").spawn("./public/scripts/qdlFlash.sh", [patch_file, flashPort, workDir, "hw8", serialPath]);
+          childFlashNAD.stdout.on("data", function (data) {
+            let output = data.toString().trim();
+            if (output.slice(-1) != '\n')
+              output += '\n';
+            if (output != lastSentData && output.length > 1)
+              quickUpdateMessage[projectIndex] += output;
+            lastSentData = output;
+            if (data.toString().includes("Flashing successfully done")) {
+              flashNADSuccess = true;
+            }
+          });
+          childFlashNAD.stderr.on("data", function (data) {
+            let output = data.toString().trim();
+            if (output.slice(-1) != '\n')
+              output += '\n';
+            if (output.length > 1)
+              quickUpdateMessage[projectIndex] += output;
+            if (data.toString().includes("Flashing successfully done")) {
+              flashNADSuccess = true;
+            }
+          });
+          childFlashNAD.on("exit", function () {
+            if (flashNADSuccess) {
+                console.log("Update NAD successfully done");
+                console.log("Attempting to push pers");
+                let lastSentData = "";
+                let flashSuccess = false;
+                childFlashPers = require("child_process").spawn("./public/scripts/pushPers.sh", [patch_file, adbPort, adbServerPort, "hw8"]);
+                childFlashPers.stderr.on("data", function (data) {
+                  console.log(data.toString());
+                })
+                childFlashPers.stdout.on("data", function (data) {
+                  let output = data.toString().replace(/[^a-z0-9!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?\n ]|\[1F|\[93m|\[92m|\[0m|\[\?25l|/gi, '').slice(0, 200).trim();
+                  if (output.slice(-1) != '\n')
+                  output += '\n';
+                  if (output != lastSentData && output.length > 1)
+                    quickUpdateMessage[projectIndex] += output;
+                  lastSentData = output;
+                  if (data.toString().includes("Installing pers successfully done")) {
+                    flashSuccess = true;
+                  }
+                });
+                childFlashPers.on("exit", function () {
+                  if (flashSuccess) {
+                    console.log("Pushing pers done");
+                    brokenDevice[projectIndex] = 0;
+                    quickUpdateSuccessful[projectIndex] = true;
+                    quickUpdateMessage[projectIndex] = "";
+                    runTimer[projectIndex] = false;
+                    totalElapsedTime[projectIndex] = 0;
+                    timeFinished[projectIndex] = true;
+                    timerProj[projectIndex].stop();
+                    timerProj[projectIndex].reset(0);
+                    timeForProject[projectIndex] = 120;
+                    timeProject[projectIndex] = 120;
+                    var time = convertTime(timeProject[projectIndex]);
+                    io.sockets.emit("clientMessageFromServer", {
+                      message: "updateTime",
+                      projID: configProjectFile.config[projectIndex].projID,
+                      projName: configProjectFile.config[projectIndex].projName,
+                      username: "QuickUpdate",
+                      hours: time.hours,
+                      minutes: time.minutes,
+                      session: configProjectFile.config[projectIndex].Session
+                    });
+                    timeElapsed[projectIndex] = 0;
+                    timerProj[projectIndex].start();
+                    runTimer[projectIndex] = true;
+                    timeFinished[projectIndex] = false;
+                  }
+                  else
+                  {
+                    powerManager.TRMRelay_OFF(ignitionPort, childProcess);
+                    powerManager.TRMRelay_OFF(powerPort, childProcess);
+                    powerManager.TRMRelay_ON(powerPort, childProcess);
+                    powerManager.TRMRelay_ON(ignitionPort, childProcess);
+                    console.log("Update pers not successfull");
+                    brokenDevice[projectIndex] = 1;
+                    timeForProject[projectIndex] = 0;
+                  }
+                });
+              }
+              else {
+                powerManager.TRMRelay_OFF(ignitionPort, childProcess);
+                powerManager.TRMRelay_OFF(powerPort, childProcess);
+                powerManager.TRMRelay_ON(powerPort, childProcess);
+                powerManager.TRMRelay_ON(ignitionPort, childProcess);
+                console.log("Update NAD not successfull");
+                brokenDevice[projectIndex] = 1;
+                timeForProject[projectIndex] = 0;
+              }
+          });
+        }
+        else {
+          powerManager.TRMRelay_OFF(ignitionPort, childProcess);
+          powerManager.TRMRelay_OFF(powerPort, childProcess);
+          powerManager.TRMRelay_ON(powerPort, childProcess);
+          powerManager.TRMRelay_ON(ignitionPort, childProcess);
+          console.log("Update passthrough image not successfull");
+          brokenDevice[projectIndex] = 1;
+          timeForProject[projectIndex] = 0;
+        }
+    });
+  }else if (projectName == "pcm3") {
+    powerManager.TRMRelay_OFF(ignitionPort, childProcess);
+    powerManager.TRMRelay_OFF(powerPort, childProcess);
+    powerManager.TRMRelay_OFF(modeSwitchPort, childProcess);
+    powerManager.TRMRelay_ON(powerPort, childProcess);
+    powerManager.TRMRelay_ON(ignitionPort, childProcess);
+
+    console.log("Attempting to flash");
+    let lastSentData;
+    let flashSuccess = false;
+    childFlash = require("child_process").spawn("./public/scripts/uuuFlash.sh", [patch_file, flashPort, serialPath, serialNumber]);
+    childFlash.stdout.on("data", function (data) {
+      let output = data.toString().replace(/[^a-z0-9!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?\n ]|\[1F|\[93m|\[92m|\[0m|\[\?25l|/gi, '').slice(0, 200).trim();
+      if (output.slice(-1) != '\n')
+      output += '\n';
+      if (output != lastSentData && output.length > 1)
+        quickUpdateMessage[projectIndex] += output;
+      lastSentData = output;
+      if (data.toString().includes("Flashing successfully done")) {
+        flashSuccess = true;
+      }
+      if (data.toString().includes("Setting serial number")) {
+        powerManager.TRMRelay_ON(modeSwitchPort, childProcess);
+        powerManager.TRMRelay_OFF(ignitionPort, childProcess);
+        powerManager.TRMRelay_OFF(powerPort, childProcess);
+        powerManager.TRMRelay_ON(powerPort, childProcess);
+        powerManager.TRMRelay_ON(ignitionPort, childProcess);
+      }
+    });
+    childFlash.on("exit", function () {
+      powerManager.TRMRelay_ON(modeSwitchPort, childProcess);
+      powerManager.TRMRelay_OFF(ignitionPort, childProcess);
+      powerManager.TRMRelay_OFF(powerPort, childProcess);
+      powerManager.TRMRelay_ON(powerPort, childProcess);
+      powerManager.TRMRelay_ON(ignitionPort, childProcess);
+      if (flashSuccess) {
+        console.log("Update successfully done");
+        brokenDevice[projectIndex] = 0;
+        quickUpdateSuccessful[projectIndex] = true;
+      }
+      else {
+        console.log("Update not successfull");
+        brokenDevice[projectIndex] = 1;
+      }
+
+      if (quickUpdateSuccessful[projectIndex] == true) {
+        quickUpdateMessage[projectIndex] = "";
+        runTimer[projectIndex] = false;
+        totalElapsedTime[projectIndex] = 0;
+        timeFinished[projectIndex] = true;
+        timerProj[projectIndex].stop();
+        timerProj[projectIndex].reset(0);
+        timeForProject[projectIndex] = 120;
+        timeProject[projectIndex] = 120;
+        var time = convertTime(timeProject[projectIndex]);
+        io.sockets.emit("clientMessageFromServer", {
+          message: "updateTime",
+          projID: configProjectFile.config[projectIndex].projID,
+          projName: configProjectFile.config[projectIndex].projName,
+          username: "QuickUpdate",
+          hours: time.hours,
+          minutes: time.minutes,
+          session: configProjectFile.config[projectIndex].Session
+        });
+        timeElapsed[projectIndex] = 0;
+        timerProj[projectIndex].start();
+        runTimer[projectIndex] = true;
+        timeFinished[projectIndex] = false;
+      }
+      else {
+        timeForProject[projectIndex] = 0;
+      }
+    });
+  }
+  else {
+    var hwVers;
+    getProjectNewestVersion(projectName, function (hwVers) {
+      hwVers = hwVers.split('\n')[0];
+      console.log("From quickUPDATE On EXIT!!!");
+      //////REGION FORCE QUICKUPDATE//////
+
+      var sshCommandChild = require("child_process");
+      var deviceIP = configProjectFile.config[projectIndex].deviceIPAddr;
+      var ethAdapterPort = configProjectFile.config[projectIndex].ethAdapterPort;
+      var keyPath = configProjectFile.config[projectIndex].keyPath;
+      var fileArray = getProjectReleaseVersions(configProjectFile.config[projectIndex].projName);
+
+      console.log("hwVers:" + hwVers);
+      var latestBuildImage;
+      var command;
+      var pathToDeviceConfigurationFile = "/opt/project/config/configuration.config";
+
+      if (projectName.match(/^hw\d/)) {
+        latestBuildImage = hwVers;
+        command = "sed -i '/^SOFTWARE/ s/_[0-9].[.0-9]*/_" + latestBuildImage + "/g' " + pathToDeviceConfigurationFile + "&& sed -i '/^SOFTWARE/ s/dev_.*/" + latestBuildImage + "/g' " + pathToDeviceConfigurationFile + " && sync ";
+        projectName.quickUpdateVersion = hwVers;
+      }
+      else {
+        var latestBuildImage = fileArray[0];
+        command = "sed -i '/^SOFTWARE/ s/dev_.*/" + latestBuildImage + "/g' " + pathToDeviceConfigurationFile + " && sed -i '/^SOFTWARE/ s/_[0-9].[.0-9]*/_" + latestBuildImage + "/g' " + pathToDeviceConfigurationFile + " && sync ";
+      }
+
+      if (ethAdapterPort)
+        enterNamespace = "sudo ip netns exec ns" + ethAdapterPort + " "
+      else
+        enterNamespace = ""
+      var sshCommand = enterNamespace + "node external/SSH/SSHConnection.js -h " + deviceIP + " -u root -k " + keyPath + " -c " + '"' + command + '"';
+      var sshCommandChildExec = sshCommandChild.exec(sshCommand,
+        function (error, stdout, stderr) {
+          if (error != null) {
+            console.log("exec error in serialChild" + error);
+          }
+        });
+      
+      //////END OF REGION FORCE QUICKUPDATE//////
+      var LeapQuickUpdateFolder = cale.toString() + "/delivery/tools/quickupdateclient/";
+      var LeapQuickUpdate = cale.toString() + "/delivery/tools/quickupdateclient/LeapQuickUpdate.jar";
+      console.log("Leap QU:", LeapQuickUpdate);
+  
+      powerManager.TRMRelay_ON(configProjectFile.config[projectIndex].relayBoardTRM30ID, childProcess);
+      powerManager.TRMRelay_ON(configProjectFile.config[projectIndex].relayBoardTRM15ID, childProcess);
+      var bootDelay = configProjectFile.config[projectIndex].BootDelay;
+  
+      var childQU = require("child_process").spawn("./public/scripts/doQuickUpdate.sh", [LeapQuickUpdateFolder, LeapQuickUpdate, patch_file, ip_actual, bootDelay]);
+  
+      childQU.stdout.on("data", function (data) {
+        var quickUpdateInfoRow = data.toString().split("\n");
+        if (data.toString() != '*') {
+          for (var j = 0; j < quickUpdateInfoRow.length; j++) {
+            quickUpdateMessage[projectIndex] = quickUpdateMessage[projectIndex] + quickUpdateInfoRow[j] + "\n";
+            if (quickUpdateInfoRow[j] == "Quickupdate not successfull!") {
+              console.log("QUICK UPDATE NOT SUCCESSFUL");
+              brokenDevice[projectIndex] = 1;
+            }
+            if (quickUpdateInfoRow[j] == "Quickupdate successfully done!") {
+              console.log("QUICK UPDATE SUCCESSFUL");
+              brokenDevice[projectIndex] = 0;
+              quickUpdateSuccessful[projectIndex] = true;
+            }
+          }
+        }
+      });
+  
+      childQU.on("exit", function () {
+        if (quickUpdateSuccessful[projectIndex] == true) {
+          quickUpdateMessage[projectIndex] = "";
+          runTimer[projectIndex] = false;
+          totalElapsedTime[projectIndex] = 0;
+          timeFinished[projectIndex] = true;
+          timerProj[projectIndex].stop();
+          timerProj[projectIndex].reset(0);
+          timeForProject[projectIndex] = 120;
+          timeProject[projectIndex] = 120;
+          var time = convertTime(timeProject[projectIndex]);
+          io.sockets.emit("clientMessageFromServer", {
+            message: "updateTime",
+            projID: configProjectFile.config[projectIndex].projID,
+            projName: configProjectFile.config[projectIndex].projName,
+            username: "QuickUpdate",
+            hours: time.hours,
+            minutes: time.minutes,
+            session: configProjectFile.config[projectIndex].Session
+          });
+          timeElapsed[projectIndex] = 0;
+          timerProj[projectIndex].start();
+          runTimer[projectIndex] = true;
+          timeFinished[projectIndex] = false;
+        }
+        else {
+          timeForProject[projectIndex] = 0;
+        }
+      });
+    });
+  }
+  saveConfigFile();
+  io.sockets.emit("addNewConfigMessageFromServer", { message: "reloadPage" });
+  if(username!="QuickUpdate")
+    deleteUserFiles(username, projectName, ip_actual);
+}
+
+function splitLockedBy(configLockedBy) {
+  var lockedBy_array = configLockedBy.split(',');
+  var lockedBy = lockedBy_array[0];
+  return lockedBy;
+}
+//function used for verifying if project is locked or not
+function verifyProjectLocked(projID, project, username, timeProj, projectIndex) {
+  //split LockedBy and verify if first string from array is user
+  var lockedBy = splitLockedBy(configProjectFile.config[projectIndex].LockedBy);
+  if (lockedBy === "BROKEN-DEVICE") lockedBy = "";
+
+  if (lockedBy !== "") {
+    //if project is locked by anybody it returns 1 to verifyProject post or
+    //to /project get request
+    return 1;
+  }
+  else {
+    //more time can be added to this time when requested
+    timeForProject[projectIndex] = parseInt(timeProj, 10);
+    //timeProject is the remaining time of the project
+    timeProject[projectIndex] = parseInt(timeProj, 10);
+
+    var minutes = 0;
+    var hours = 0;
+    var close = true;
+    totalElapsedTime[projectIndex] = 0;
+    timeElapsed[projectIndex] = 0;
+    timeFinished[projectIndex] = false;
+    runTimer[projectIndex] = true;
+    brokenDevice[projectIndex] = 0;
+
+    if (timeProject[projectIndex] > 3600) {
+      timeWarning[projectIndex] = 3600;
+      warnUser[projectIndex] = true;
+    }
+    else {
+      timeWarning[projectIndex] = 5 * 60;
+      warnUser[projectIndex] = true;
+    }
+
+    //here the server creates a timer for every project
+    timerProj[projectIndex] = new Stopwatch(null, options);
+    timerProj[projectIndex].reset();
+    timerProj[projectIndex].start();
+    //if time for project is less than 10s user will not be able to reload the page anymore
+
+    //every 10 s the on time is called and timeProject is decremented with 60 every 60 seconds
+    timerProj[projectIndex].onTime(function (time) {
+      //console.log(projectIndex + ":" + floor(time.ms/1000));
+      //getDay gets current day in number format(0-6 where 0 is Sunday)
+      var currentDate = new Date().getDay();
+      //when current date is Saturday or Sunday timer is stopped
+      if ((currentDate !== 0 && currentDate !== 6)) {
+        if (runTimer[projectIndex]) {
+          timeElapsed[projectIndex] += 10;
+          totalElapsedTime[projectIndex] += 10;
+        }
+        else {
+          if (!timeFinished[projectIndex])
+            runTimer[projectIndex] = true;
+        }
+      }
+      else {
+        if (runTimer[projectIndex]) {
+          runTimer[projectIndex] = false;
+        }
+      }
+
+      if (configProjectFile.config[projectIndex].LockedBy != "QuickUpdate") {
+        if (runTimer[projectIndex]) {
+          timeElapsed[projectIndex] = sendConvertedTime(timeElapsed[projectIndex], projectIndex, project, projID, brokenDevice[projectIndex], username);
+          for (let i = 0; i < loginFile.users.length; i++) { //send mail after a default time that was set in settings
+            if (loginFile.users[i].user == username && loginFile.users[i].notifyOption.mail == true) {
+              if (timeProject[projectIndex] == (loginFile.users[i].notifyTime * 60) && timeElapsed[projectIndex] < 10) {
+                sendMail = require("child_process");
+                sendMail.exec("./public/scripts/sendmail.sh " + "notifyMail" + ' ' + loginFile.users[i].mail + ' ' + loginFile.users[i].notifyTime + ' ' + project + ' ' + sessions[projectIndex],
+                  function (error, stdout, stderr) {
+                    if (error != null) {
+                      console.log("error" + error);
+                      console.log("STDERR = " + stderr);
+                      console.log("STDOUT = " + stdout);
+                    }
+
+                  });
+                console.log("MAIL WAS SENT");
+                //if user was found, don't search for others
+                break;
+              }
+            }
+            if (loginFile.users[i].user == username && loginFile.users[i].notifyOption.browser == true) {
+              if (timeProject[projectIndex] == (loginFile.users[i].notifyTime * 60) && timeElapsed[projectIndex] < 10) {
+                io.sockets.emit("projectMessageFromServer", { message: "browserNotification", username: username, projID: configProjectFile.config[projectIndex].projID })
+                console.log("Browser notification was sent!");
+              }
+            }
+
+
+          }
+          configProjectFile.config[projectIndex].LockedFor = timeProject[projectIndex]; // new code
+          saveConfigFile(); // new code
+          if ((totalElapsedTime[projectIndex] >= timeForProject[projectIndex] && runTimer[projectIndex])) {
+            //here the quickUpdate should start
+            runTimer[projectIndex] = false;
+            timeElapsed[projectIndex] = 0;
+            totalElapsedTime[projectIndex] = 0;
+            timeFinished[projectIndex] = true;
+            timerProj[projectIndex].stop();
+            timerProj[projectIndex].reset(0);
+            closeProject(socketForProject[projectIndex]);
+            configProjectFile.config[projectIndex].LockedBy = "QuickUpdate";
+            timeForProject[projectIndex] = configProjectFile.config[projectIndex].QuickUpdateTime + configProjectFile.config[projectIndex].BootDelay;
+            timeProject[projectIndex] = configProjectFile.config[projectIndex].QuickUpdateTime + configProjectFile.config[projectIndex].BootDelay;
+
+            saveConfigFile();
+
+            sendProjectState("quickUpdateInProgress", projID, project, username, configProjectFile.config[projectIndex].QuickUpdateTime, sessions[projectIndex], configProjectFile.config[projectIndex].HW, configProjectFile.config[projectIndex].SW);
+
+            timerProj[projectIndex].start();
+            timeElapsed[projectIndex] = 0;
+            io.sockets.emit("addNewConfigMessageFromServer", { message: "reloadPage" });
+            timeFinished[projectIndex] = false;
+            runTimer[projectIndex] = true;
+          }
+          if (timeProject[projectIndex] <= timeWarning[projectIndex] && warnUser[projectIndex]) {
+            if (timeProject[projectIndex] < 5 * 60) {
+              warnUser[projectIndex] = false;
+            }
+            else {
+              if (timeWarning[projectIndex] > 5 * 60) {
+                warnUser[projectIndex] = true;
+                timeWarning[projectIndex] = 5 * 60;
+              }
+              else {
+                warnUser[projectIndex] = false;
+              }
+            }
+            var time = convertTime(timeProject[projectIndex]);
+            io.sockets.emit("projectMessageFromServer", { message: "warnUser", projName: project, hours: time.hours, minutes: time.minutes, projID: projID });
+
+            console.log("Time Warning:" + timeWarning[projectIndex]);
+            console.log("WarnUser:" + warnUser[projectIndex]);
+          }
+        }
+      }
+      else {
+        if (runTimer[projectIndex]) {
+          timeElapsed[projectIndex] = sendConvertedTime(timeElapsed[projectIndex], projectIndex, project, projID, brokenDevice[projectIndex], splitLockedBy(configProjectFile.config[projectIndex].LockedBy));
+          if (totalElapsedTime[projectIndex] >= timeForProject[projectIndex]) {
+
+            runTimer[projectIndex] = false;
+            timeFinished[projectIndex] = true;
+            timerProj[projectIndex].stop();
+            sessions[projectIndex] = "";
+            console.log("DISCONNECTION");
+            var newLeapVersion = "";
+            var childSWVersion = getSWVersionProcess(configProjectFile.config[projectIndex].deviceIPAddr);
+            childSWVersion.stdout.on("data", function (data) {
+              newLeapVersion = data.toString().slice(0, -1);
+            });
+            childSWVersion.on("exit", () => {
+              //when the script cannot get version
+              if (newLeapVersion === "Not available\n") {
+                newLeapVersion = newLeapVersion.slice(0, -1);
+              }
+              //when the script is blocked while getting the version
+              if (newLeapVersion === "") {
+                newLeapVersion = "Not available";
+              }
+              configProjectFile.config[projectIndex].SW = newLeapVersion;
+              configProjectFile.config[projectIndex].LockedFor = 0;
+
+              console.log("USER IS:" + username);
+
+              switch (brokenDevice[projectIndex]) {
+                case 0:
+                  //device is not broken
+                  console.log("QuickUpdate was successful - device is not broken - projID:" + configProjectFile.config[projectIndex].projID);
+                  configProjectFile.config[projectIndex].LockedBy = "";
+                  break;
+                case 1:
+                  //device has quickUpdate problems
+                  console.log("QuickUpdate was not successful - device is broken - projID:" + configProjectFile.config[projectIndex].projID);
+                  configProjectFile.config[projectIndex].LockedBy = "BROKEN-DEVICE";
+                  username = "BROKEN-DEVICE";
+                  break;
+                case 2:
+                  //device has a problem reported by user
+                  console.log("User reported a problem for device - projID:" + configProjectFile.config[projectIndex].projID);
+                  configProjectFile.config[projectIndex].LockedBy = "BROKEN-DEVICE";
+                  username = "BROKEN-DEVICE";
+                  break;
+              }
+
+              saveConfigFile();
+              sendProjectState("clientDisconnectFromProject", projID, project, username, 0, "", configProjectFile.config[projectIndex].HW, configProjectFile.config[projectIndex].SW);
+            });
+          }
+        }
+      }
+    });
+    return 0;
+  }
+}
+
+function makeAdminList() {
+  var j = 0;
+  for (let i = 0; i < loginFile.users.length; i++) { //send mail after a default time that was set in settings
+    if (loginFile.users[i].admin === true) {
+      adminList[j++] = loginFile.users[i].mail;
+    }
+  }
+}
+
+//html requests a get method and server responds with a html page with all shellinabox frames
+app.get("/project", function (req, res) {
+  req.accepts(["json", "text"]);
+  console.log("LOADING PAGE " + req.query.projectName);
+  console.log("USER IS : " + req.session.username);
+  //here we can verify if project is locked
+  var projectIndex = findProject(req.query.projID);
+
+  console.log("FROM PROJECT");
+  //first we verify if the user is logged
+  //if user is not logged we redirect to the login page
+  if (req.session.username) {
+    //in case the user has logged out from another browser, this function
+    //tells the auth module that this user is still logged on other browser
+    auth.checkUser(req.session.username);
+
+    projectIndices[req.query.projID] = projectIndex;
+    if (req.query.session != undefined) {
+      sessions[projectIndex] = req.query.session;
+    }
+    else {
+      sessions[projectIndex] = "";
+    }
+    //is project is locked by the user who tries to get the project than it allows the user
+    //to get the project
+    //if the user who tries to get the project page is not the one who locked the project
+    //then the server will redirect him to showProj page
+    var lockedBy = splitLockedBy(configProjectFile.config[projectIndex].LockedBy)
+    if (req.session.username === lockedBy) {
+      //before loading project the server closes the other instance of project if it exists
+      io.sockets.emit("projectMessageFromServer", {
+        message: "close_this_project",
+        projName: req.query.projectName,
+        projID: req.query.projID
+      });
+
+      //loading page with interfaces
+      loadProjectPage(req.query.projID, req.query.projectName, req.session.username, function (data) {
+        res.send(data);
+      });
+
+    }
+    else {
+      res.redirect("/showProj");
+    }
+
+  }
+  else {
+    res.redirect("/");
+    //res.render(__dirname + "/public/index.html");
+  }
+
+});
+app.use("/settings", settings); //all post and get request are redirected to setAcount settings.mst
+
+app.get("/addNewConfig", function (req, res) {
+  var loginUsersFile = new SelfReloadJSON(passwordFile);
+  userAdmin[req.session.username] = auth.checkAdmin(req.session.username, loginUsersFile);
+  if (req.session.username && userAdmin[req.session.username]) {
+    req.accepts(["json", "text"]);
+    var userJson = { "username": req.session.username };
+    var JsonFile = extend({}, configProjectFile, configProjectFile.serverConfig, userJson);
+    var html = mustache.to_html(mustacheaddNewConfig, JsonFile);
+    res.send(html);
+  }
+  else {
+    res.redirect("/");
+  }
+
+});
+
+//html requests get method for opening a webswing aplication
+app.get("/webswing", function (req, res) {
+
+  req.accepts(["json", "text"]);
+  var i = findProject(req.query.projID);
+  if (req.session.username) {
+    console.log("Webswing")
+    var lockedBy = splitLockedBy(configProjectFile.config[i].LockedBy)
+    if (req.session.username === lockedBy) {
+      var userJson = { "username": req.session.username };
+      let appConfig = { webswingApplicationType: req.query.webswingApplicationType };
+      var JsonFile = extend({}, configProjectFile.config[i], configProjectFile.serverConfig, appConfig, userJson);
+      var html = mustache.to_html(mustacheTemplateWebswingtemplatePage, JsonFile);
+      res.send(html);
+    }
+    else {
+      res.redirect("/showProj");
+    }
+
+  }
+  else {
+    res.redirect("/");
+    //res.render(__dirname + "/public/index.html");
+  }
+
+});
+
+//html requests post method which will send the page with projects if user authentification data is correct
+//if authentification data is not correct it will redirect to the login page
+
+
+//Download serial logs
+app.get("/download", function (req, res) {
+  console.log("projID:" + req.query.projID);
+  var projectIndex = findProject(req.query.projID);
+  var serialID = req.query.serialID;
+  if (req.session.username) {
+    if (myPrjName[req.query.projID] !== "" && req.session.username == userForDevice[req.query.projID]) {
+      var path = __dirname + "/userSpace/" + req.session.username + '/' + myPrjName[req.query.projID] + '/' + myDeviceIP[req.query.projID] + '/' + serialID;
+      var files = getSerialLogsFileNames(path, [".txt"]).slice(1);
+      fs.createWriteStream(path + "/MinervaSerialLogs.txt", { "flags": "w" });
+      for (var i in files) {
+        fs.writeFileSync(path + "/MinervaSerialLogs.txt", fs.readFileSync(files[i]), { "flag": "a" });
+      }
+      var fileNumbers = getSerialLogsFileNumbers(path, [".txt"]);
+      var getLogsFileNumbers = fileNumbers.slice(1);
+      var maxIndexOfUserLogs = Math.max.apply(null, getLogsFileNumbers);
+
+      if (serialID == "firstSerial") {
+        userDownloadFile[projectIndex].userNotified = false;
+        userDownloadFile[projectIndex].lastDownloadedFileIndex = parseInt(maxIndexOfUserLogs);
+        userDownloadFile[projectIndex].numberOfMBtoDownload = 0;
+      } else if (serialID == "secondSerial") {
+        userDownloadFileSecond[projectIndex].userNotified = false;
+        userDownloadFileSecond[projectIndex].lastDownloadedFileIndex = parseInt(maxIndexOfUserLogs);
+        userDownloadFileSecond[projectIndex].numberOfMBtoDownload = 0;
+      }
+
+      for (var i in files) {
+        //delete all files except last one which will become first file for the next download
+        var fileIndex = getFileIndex(files[i]);
+        if (parseInt(fileIndex) !== parseInt(maxIndexOfUserLogs)) {
+          fs.unlink(files[i], function (err) {
+            if (err) throw err;
+            // if no error, file has been deleted successfully
+          });
+        }
+      }
+      saveUserSerialDownloadFile(req.session.username, configProjectFile.config[projectIndex].projName, configProjectFile.config[projectIndex].deviceIPAddr, projectIndex, serialID);
+      res.download(path + "/MinervaSerialLogs.txt");
+    }
+    else {
+      res.send("Cannot get file");
+    }
+  }
+});
+
+function getFileIndex(file) {
+  var lastPartOfFileName = file.split("serialLogs_");
+  var index = lastPartOfFileName[1].split(".txt")[0];
+  return index;
+}
+
+//Composing a new configuration for the newly added device in order to use the Java applications
+function composeWebswingConfig(applName, jarFile, hDir, mClass, argument) {
+  let wsConfig = {
+    name: applName,
+    jreExecutable: "${java.home}/bin/java",
+    javaVersion: "${java.version}",
+    classPathEntries: [jarFile],
+    homeDir: hDir,
+    theme: "Murrine",
+    maxClients: 100,
+    sessionMode: "CONTINUE_FOR_BROWSER",
+    swingSessionTimeout: -1,
+    allowStealSession: true,
+    antiAliasText: true,
+    authorization: false,
+    debug: true,
+    isolatedFs: true,
+    authentication: false,
+    directdraw: false,
+    allowDelete: false,
+    allowDownload: true,
+    allowAutoDownload: true,
+    allowUpload: true,
+    uploadMaxSize: 300,
+    allowJsLink: true,
+    mainClass: mClass,
+    args: argument
+  };
+  return wsConfig;
+}
+
+function updateWebswingConfig() {
+
+  // Name format for each application config in webswing.config:
+  // <project_name>_<IP_address>_<appl_type>
+
+  var applTypes = ["quickupdateclient", "serviceclient", "systemlogservice"];
+  var applJarFiles = ["LeapQuickUpdate.jar", "LeapServiceClient.jar", "LeapSystemLogServiceClient.jar"];
+  var applClassNames = ["QuickUpdateClient", "org.conti.gui.ServiceClient", "SystemLogServiceClient"];
+  var applArguments = ["", "", ""];
+
+
+  //delete lines from devices that were deleted in configProjectFile
+  if (webswingConfigFile.applications.length / JAVA_APPL_TYPES_FOR_EACH_PROJECT > configProjectFile.config.length) {
+    for (var i = 0; i < configProjectFile.config.length; i++) {
+      var wsName = configProjectFile.config[i].projName + "_" + configProjectFile.config[i].deviceIPAddr + "_" + applTypes[0];
+      //remove device
+      if (webswingConfigFile.applications[i * JAVA_APPL_TYPES_FOR_EACH_PROJECT].name !== wsName) {
+        webswingConfigFile.applications.splice(i * JAVA_APPL_TYPES_FOR_EACH_PROJECT, JAVA_APPL_TYPES_FOR_EACH_PROJECT);
+      }
+    }
+  }
+  for (var i = 0; i < configProjectFile.config.length; i++) {
+    var projectVersion = getProjectReleaseVersions(configProjectFile.config[i].projName);
+    for (var j = 0; j < JAVA_APPL_TYPES_FOR_EACH_PROJECT; j++) {
+      var wsName = configProjectFile.config[i].projName + "_" + configProjectFile.config[i].deviceIPAddr + "_" + applTypes[j];
+      var wsClassName = applJarFiles[j];
+      var wsHomeDir = projectsPath + configProjectFile.config[i].projName + "/" + projectVersion[0] + "/delivery/tools/" + applTypes[j];
+      var wsMainClass = applClassNames[j];
+      var wsArgs = "";
+      if (applTypes[j] === "quickupdateclient") {
+        wsArgs = "-gui file " + configProjectFile.config[i].deviceIPAddr;
+      }
+
+      if (applTypes[j] === "serviceclient") {
+        wsArgs = "-g -d " + configProjectFile.config[i].deviceIPAddr + " -l";
+      }
+
+      var wsConfig = composeWebswingConfig(wsName, wsClassName, wsHomeDir, wsMainClass, wsArgs);
+      webswingConfigFile.applications[i * JAVA_APPL_TYPES_FOR_EACH_PROJECT + j] = wsConfig;
+    }
+  }
+
+  fs.writeFileSync("./external/webswing-2.4/webswing.config", JSON.stringify(webswingConfigFile, null, 9), function (err) {
+    if (err) return console.log(err);
+  });
+}
+
+configProjectFile.on("updated", function (json) {
+  updateWebswingConfig();
+});
+
+function extend(target) {
+  var sources = [].slice.call(arguments, 1);
+  sources.forEach(function (source) {
+    for (var prop in source) {
+      target[prop] = source[prop];
+    }
+  });
+  return target;
+}
+
+
+function simpleFileWriteSync(filePath, content) {
+  var options = { encoding: "utf-8", flag: "w" };
+  fs.writeFileSync(filePath, content, options);
+  console.log("Write file data complete.")
+}
+
+
+function simpleReadFileSync(filePath) {
+  var options = { encoding: "utf-8", flag: 'r' };
+  var buffer = fs.readFileSync(filePath, options);
+  console.log("File content : " + buffer);
+  return buffer;
+}
+
+function getSerialLogsFileNames(dir, files_) {
+  files_ = files_ || [];
+  var files = fs.readdirSync(dir);
+  for (var i in files) {
+    var name = dir + '/' + files[i];
+    if (fs.statSync(name).isDirectory()) {
+      getFiles(name, files_);
+    } else {
+      if (name.indexOf("serialLogs") !== -1) {
+        files_.push(name);
+      }
+    }
+  }
+  return files_;
+}
+
+function getSerialLogsFileNumbers(dir, files_) {
+  files_ = files_ || [];
+  var filesNumber = files_;
+  var files = fs.readdirSync(dir);
+  for (var i in files) {
+    var name = dir + '/' + files[i];
+    if (fs.statSync(name).isDirectory()) {
+      getFiles(name, files_);
+    } else {
+      if (name.indexOf("serialLogs_") !== -1) {
+        var fileNumber = (name.split("serialLogs_")[1]).split(".txt")[0]; //get all available numbers from names of serialLogs.txt files
+        filesNumber.push(fileNumber);
+      }
+    }
+  }
+  return filesNumber;
+}
+
+var clients = {};
+//childs variables are the child processes started for each user
+var childs = {};
+var availablePorts = [];
+
+var arr = {};
+//at ctrl+c the java app is killed
+var cleanExit = function () {
+  //closing all the projects so that on server restart, users will be able to access any project
+  killRelayApp = require("child_process").exec("killAllRelayApp.sh");
+  closeAllProjects();
+  saveConfigFile();
+  console.log("Exit Application");
+  powerManager.childKill();
+  setTimeout(function () { process.exit(); }, 2000);
+};
+process.on("SIGINT", cleanExit);
+
+process.on("uncaughtException", function (err) {
+  console.log("Uncaught exception - " + err);
+});
+
+var usersSockets = {};
+//whenever a client connects to the server a new socket is created
+io.sockets.on("connection", function (socket, username) {
+  var index; // stores the index of the currently being edited project
+  // When the username is received its stored as a session variable and informs the other people
+
+  socket.on("messageFromAccount", function (data) {
+    let messageFromSocket = socketSettings.getInfoFromSettings(data);
+    if (messageFromSocket != null)
+      socket.emit("setAccountMessageFromServer", messageFromSocket);
+  });
+
+  //socket can send messages to project page
+  socket.on("messageFromProject", async function (data) {
+    switch (data.message) {
+
+      case "startFileManagerServer":
+        console.log("****STARTING FILE MANAGER***", data.projID, data.username);
+        console.log("pid Fm:", fmServer.pid, data.username);
+        if (fmServer.pid) { //server is running
+          socket.emit("projectMessageFromServer", {
+            message: "FileManagerServerIsUp",
+            ipServer: configProjectFile.serverConfig.IP_Address,
+            projId: data.projID,
+            userName: data.username,
+            projName: data.projName,
+            FileManagerPort: configProjectFile.serverConfig.FileManagerPort
+          });
+        } else {
+          console.log("File manager is down");
+        }
+        break;
+      //if user is loggedInUsers of username is false it means the user wants to logout
+      //it will send a meesage of logout to project page which will send a deactivateProject message
+      //this message tells the server project has to be closed
+      //when user presses logout from project: /logout -> logoutUser(client) -> checkIfLogged(server) ->
+      //close_this(client)
+      case "checkIfLogged":
+        if (loggedInUsers[data.username] == false) {
+          if (childs[socket.id]) {
+            kill(socket.id);
+            killProcessForSocket(socket.id);
+          }
+
+          socket.emit("projectMessageFromServer", { message: "close_this" });
+        }
+        break;
+      //when a new client gets the project page it sends the time for the project to
+      //all clients connected to the server
+      case "new_client":
+        {
+          var execChild = require("child_process");
+          var ProjectIndex = findProject(data.projID);
+          var fileManagerPort = configProjectFile.config[ProjectIndex].FileManagerPort;
+          var fileArray = getProjectReleaseVersions(data.projName);
+          var lockedBy = configProjectFile.config[ProjectIndex].LockedBy;
+          var fileArray2 = getCustomImages(data.projName, lockedBy, configProjectFile.config[ProjectIndex].deviceIPAddr);
+          var fileArray3 = getIMXImages(data.projName);
+
+          socket.emit("projectMessageFromServer", { message: "files", fileArray, fileArray2, fileArray3});
+          if (serialChildExec1 === undefined || serialChildExec2 === undefined) {
+            serialChildExec1 = execChild.exec("");
+            serialChildExec2 = execChild.exec("");
+            sshChildExec = execChild.exec("");
+            vncChildExec = execChild.exec("");
+          }
+
+          childs[socket.id] = { serialChildExec1, serialChildExec2, sshChildExec, vncChildExec, fileManagerPort, ProjectIndex };
+
+          console.log("NEW_CLIENT");
+          usersSockets[socket.id] = data.username;
+
+          var hours = floor(timeProject[childs[socket.id].ProjectIndex] / 3600);
+          var minutes = floor((timeProject[childs[socket.id].ProjectIndex] - hours * 3600) / 60);
+          var hardware = data.hardware;
+          console.log(data.username + " locked " + data.projName + " for " + hours + "h" + minutes + "m");
+          socket.broadcast.emit("clientMessageFromServer",
+            {
+              message: "clientConnectedToProject",
+              projName: data.projName,
+              projID: data.projID,
+              lockedBy: lockedBy,
+              session: configProjectFile.config[ProjectIndex].Session,
+              hours: hours,
+              minutes: minutes,
+              hardware: hardware
+            });
+          //socket changes for project every time user makes a get request on the project page
+          socketForProject[ProjectIndex] = socket.id;
+        }
+        break;
+      //when user requests more time server has to send new time to all clients
+      case "requestTime":
+        {
+          //var projectIndex = findProject(data.projName);
+
+          var projectIndex = projectIndices[data.projID];
+
+          var timeToAdd = parseInt(data.requestedTime, 10);
+          if (timeToAdd >= 3600) {
+            timeWarning[projectIndex] = 3600;
+            warnUser[projectIndex] = true;
+          }
+          else {
+            timeWarning[projectIndex] = 5 * 60;
+            warnUser[projectIndex] = true;
+          }
+          //if the time you want to request + the time you already have exceeds 48 hours
+          //time for that project will be 48 hours
+          if ((timeToAdd + timeProject[projectIndex]) >= 48 * 3600) {
+            timeForProject[projectIndex] = 48 * 3600;
+            timeProject[projectIndex] = 48 * 3600;
+            socket.emit("projectMessageFromServer", { message: "exceededTime", projName: data.projName, projID: data.projID });
+            totalElapsedTime[projectIndex] = 0;
+            timeElapsed[projectIndex] = 0;
+          }
+          else {
+            //total time that the server remains locked is incremented with the value requested
+            timeForProject[projectIndex] += timeToAdd;
+            //time remaining for project to remain locked by user(not sure this is right-maybe it should be -1)
+            timeProject[projectIndex] += timeToAdd;
+          }
+
+          var dateOfRelease = new Date();
+          var intDate = parseInt(dateOfRelease.getTime());
+          var weekend = false;
+          intDate += timeProject[projectIndex] * 1000;
+          dateOfRelease.setTime(intDate);
+          if (dateOfRelease.getDay() === 0 || dateOfRelease.getDay() === 6) {
+            weekend = true;
+          }
+          socket.emit("projectMessageFromServer", { message: "timeOfRelease", projID: data.projID, dateOfRelease: dateOfRelease.getTime(), weekend: weekend })
+          var hours = floor(timeProject[projectIndex] / 3600);
+          var minutes = floor((timeProject[projectIndex] - hours * 3600) / 60);
+          socket.emit("projectMessageFromServer", { message: "updateTime", hours: hours, minutes: minutes, projName: data.projName, projID: data.projID });
+          socket.broadcast.emit("clientMessageFromServer", { message: "clientConnectedToProject", hours: hours, minutes: minutes, projName: data.projName, projID: data.projID, lockedBy: configProjectFile.config[projectIndex].LockedBy, session: sessions[projectIndex], hardware: configProjectFile.config[projectIndex].HW });
+          console.log("TotalTime:" + timeForProject[projectIndex]);
+        }
+        break;
+      case "quickUpdateState":
+        var projectIndex = projectIndices[data.projID];
+        console.log("QUICKUPDATESTATE:" + quickUpdateSuccessful[projectIndex]);
+        if (quickUpdateSuccessful[projectIndex] == false) {
+          socket.emit("projectMessageFromServer", { message: "quickUpdateFailed", quickUpdateMessage: quickUpdateMessage[projectIndex] });
+          quickUpdateSuccessful[projectIndex] = true;
+        }
+        break;
+      case "fixedProblem":
+        var projectIndex = projectIndices[data.projID];
+        reportProblemMail[projectIndex] = "";
+        brokenDevice[projectIndex] = 0;
+        break;
+      case "reportProblemState":
+        var projectIndex = projectIndices[data.projID];
+        if (brokenDevice[projectIndex] !== 0)
+          socket.emit("projectMessageFromServer", { message: "reportProblemMessage", reportProblemMessage: reportProblemMail[projectIndex] });
+        break;
+      case "requestStateOfDevice":
+        var projectIndex = projectIndices[data.projID];
+        if (brokenDevice[projectIndex] !== 1 && reportProblemMail[projectIndex] === "") {
+          brokenDevice[projectIndex] = 0;
+        }
+        else if (configProjectFile.config[projectIndex].LockedBy.indexOf("BROKEN-DEVICE") > -1 && brokenDevice[projectIndex] === 0) {
+          brokenDevice[projectIndex] = 1;
+        }
+        console.log("State of device:" + brokenDevice[projectIndex]);
+        socket.emit("projectMessageFromServer", { message: "requestStateOfDevice", stateOfDevice: brokenDevice[projectIndex] });
+        break;
+      case "requestSession":
+        var projectIndex = projectIndices[data.projID];
+        socket.emit("projectMessageFromServer", { message: "getSession", session: configProjectFile.config[projectIndex].Session });
+        break;
+      case "sendEmailProblemReport":
+        var projectIndex = projectIndices[data.projID];
+        brokenDevice[projectIndex] = 2;
+        console.log("Device put into broken device section");
+        reportProblemMail[projectIndex] = data.emailBody;
+        sendMail = require("child_process");
+        sendMail.exec("./public/scripts/sendmail.sh " + "reportProblem" + ' ' + data.mailTo + ' ' + '"' + data.emailBody + '"',
+          function (error, stdout, stderr) {
+            if (error != null) {
+              console.log("error" + error);
+              console.log("STDERR = " + stderr);
+              console.log("STDOUT = " + stdout);
+            }
+          });
+        console.log("REPORT MAIL WAS SENT");
+        break;
+      case "requestHardware":
+        for (var i = 0; i < configProjectFile.config.length; i++) {
+          if (configProjectFile.config[i].deviceIPAddr == data.deviceIPAddr) {
+            socket.emit("projectMessageFromServer", { message: "updateLEAPVersion", software: configProjectFile.config[i].SW });
+            break;
+          }
+        }
+        break;
+      //when user loads the project page time that can be requested has to be taken from the timeConfig file
+      case "getTimeForProjects":
+        for (var i = 0; i < timeForProjConfig.time.length; i++) {
+          socket.emit("projectMessageFromServer", { message: "receiveTimeForProjects", time: timeForProjConfig.time[i].time, index: i });
+        }
+        break;
+      //this is called when the user gets the project page
+      case "getTimeForThis":
+        var projectIndex = projectIndices[data.projID];
+
+        var hours = floor(timeProject[projectIndex] / 3600);
+        var minutes = floor((timeProject[projectIndex] - hours * 3600) / 60);
+        console.log("TIME FOR PROJECT = " + hours + "h " + minutes + "m");
+        socket.emit("projectMessageFromServer", { message: "receiveTimeForThis", hours: hours, minutes: minutes });
+        break;
+  
+      //when user wants to close or open the power relay
+      case "toggleTRM30":
+        if (data.toggleState === true) {
+          var childProcess = powerManager.getRelayAppProcess();
+          powerManager.TRMRelay_ON(data.relayPin30, childProcess);
+        }
+        else {
+          var childProcess = powerManager.getRelayAppProcess();
+          powerManager.TRMRelay_OFF(data.relayPin30, childProcess);
+        }
+        powerManager.TRMRelay_State(data.relayPin30);
+        break;
+
+      case "toggleTRM15":
+        //ignition
+        if (data.toggleState === true) {
+          var childProcess = powerManager.getRelayAppProcess();
+          powerManager.TRMRelay_ON(data.relayPin15, childProcess);
+        }
+        else {
+          var childProcess = powerManager.getRelayAppProcess();
+          powerManager.TRMRelay_OFF(data.relayPin15, childProcess);
+        }
+        powerManager.TRMRelay_State(data.relayPin15);
+        break;
+
+      //when user wants to start power manager script
+      case "executeThisScript":
+        var promiseScript = powerManager.acceptAndHandleScript(data.script, data.howManyTimes, data.relayPin15, data.relayPin30, powerManager.getRelayAppProcess(), data.projID, io);
+        promiseScript.then(function (result) {
+
+          io.sockets.emit("projectMessageFromServer", { message: "finnishPowerMangerScript", projID: data.projID });
+        },
+
+          function (err) {
+            console.log(err);
+            io.sockets.emit("projectMessageFromServer", { message: "errorInPowerMangerScript", errorMesage: err, projID: data.projID });
+          });
+        break;
+
+      //when user wants to stop power manager script
+      case "stopPowerMangerScript":
+        powerManager.stopScript(data.projID);
+        console.log("Power manager script stoped");
+        socket.emit("projectMessageFromServer", { message: "stopedPowerMangerScript" });
+        break;
+
+      case "deactivateProject":
+        //this is called from project page when user wants to logout and every time
+        //user leaves project page
+        //if a script is running it will be stoped
+        console.log("Deactivate Project");
+        kill(socket.id);
+        killProcessForSocket(socket.id);
+        //message from server to close the page with the project
+        socket.emit("projectMessageFromServer", { message: "close_this" });
+        break;
+
+      case "getPowerManagerScript":
+
+        //gets and send the script and times after refresh
+        var script = powerManager.getScript(data.projID);
+        var times = powerManager.getTimes(data.projID);
+        socket.emit("projectMessageFromServer", { message: "getScript", script: script, times: times });
+
+        break;
+      case "requestAdmins":
+        //send list of admins emails
+        socket.emit("projectMessageFromServer", { message: "requestAdmins", adminList: adminList });
+        break;
+      case "quickUpdateFromPage":
+        //this is called when user wants to do a QuickUpdate
+        var projectName = data.projName;
+        var patch_file;
+        var projectIndex = projectIndices[data.projID];
+        var ip_actual = configProjectFile.config[projectIndex].deviceIPAddr
+        var cale = projectsPath + projectName + '/' + data.quickUpdateVersion.toString();
+        var quickUpdateFinished = false;
+        var childQU;
+        var childFlash;
+
+        if (data.imageType == "custom") {
+          if (data.quickUpdateVersion[0] != '/'){
+            patch_file = "userSpace/" + configProjectFile.config[projectIndex].LockedBy + '/' + projectName + '/' + ip_actual + "/images/" + data.quickUpdateVersion;
+          } else {
+            patch_file = data.quickUpdateVersion
+          }
+          socket.emit("updateMessage", { message: "Checking image type...\n" });
+          data.imageType = await checkZipForFile(patch_file, socket)
+        }
+        else if (data.imageType == "imx"){
+          if (projectName == "pcm3") {
+            if (data.checkfordevIMX == true){
+              patch_file = cale.toString() + "/develop/uuu-flash-spinor-emmc.zip";
+            }
+            else {
+              patch_file = cale.toString() + "/build/uuu-flash-spinor-emmc.zip";
+            }
+          }
+          else if (projectName == "hw8"){
+            patch_file = "public/traton_imx_images/" + data.quickUpdateVersion;
+          }
+        }
+        else {
+          if (projectName == "pcm3") {
+            patch_file = cale.toString() + "/delivery/nad/4K";
+          }
+          else if (data.checkfordevNAD == true) {
+            if (projectName == "hw8") {
+              patch_file = cale.toString() + "/hw8/develop";
+            }
+            else {
+              patch_file = cale.toString() + "/develop/" + projectName + "_" + data.quickUpdateVersion.toString() + "_quickupdatePatch_develop";
+            }
+            if (!fs.existsSync(patch_file)) {
+              console.log("No patch for dev quickupdate");
+            }
+          }
+          else {
+            if (projectName == "hw8") {
+              patch_file = cale.toString() + "/hw8/build";
+            }
+            else {
+              patch_file = cale.toString() + "/delivery/update/" + projectName + "_" + data.quickUpdateVersion.toString() + "_quickupdatePatch";
+            }
+            if (!fs.existsSync(patch_file)) {
+              console.log("No quickupdate patch file present!");
+            }
+          }
+        }
+
+        console.log("IP:", ip_actual);
+        console.log("Patch File:", patch_file);
+        console.log("ImageType: ", data.imageType);
+
+        var childProcess = powerManager.getRelayAppProcess();
+        let powerPort = configProjectFile.config[projectIndex].relayBoardTRM30ID;
+        let ignitionPort = configProjectFile.config[projectIndex].relayBoardTRM15ID;
+        let modeSwitchPort = configProjectFile.config[projectIndex].modeSwitchPort;
+        let flashPort = configProjectFile.config[projectIndex].flashPort;
+        let adbPort = configProjectFile.config[projectIndex].adbPort;
+        let adbServerPort = configProjectFile.config[projectIndex].adbServerPort;
+        let serialPath = configProjectFile.config[projectIndex].serialConnection1;
+        let serialNumber = configProjectFile.config[projectIndex].serialNumber;
+        let workDir = "userSpace/" + configProjectFile.config[projectIndex].LockedBy + '/' + projectName + '/' + ip_actual + "/images"
+        
+        if (data.imageType == "imx") {
+          powerManager.TRMRelay_OFF(powerPort, childProcess);
+          powerManager.TRMRelay_OFF(ignitionPort, childProcess);
+          powerManager.TRMRelay_OFF(modeSwitchPort, childProcess);
+          powerManager.TRMRelay_ON(powerPort, childProcess);
+          powerManager.TRMRelay_ON(ignitionPort, childProcess);
+
+          console.log("Attempting to flash IMX");
+          let lastSentData = "";
+          let flashSuccess = false;
+          childFlash = require("child_process").spawn("./public/scripts/uuuFlash.sh", [patch_file, flashPort, serialPath, serialNumber]);
+          childFlash.stdout.on("data", function (data) {
+            let output = data.toString().replace(/[^a-z0-9!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?\n ]|\[1F|\[93m|\[92m|\[0m|\[\?25l|/gi, '').slice(0, 200).trim();
+            if (output.slice(-1) != '\n')
+            output += '\n';
+            if (output != lastSentData && output.length > 1)
+            socket.emit("updateMessage", { message: output });
+            lastSentData = output;
+            if (data.toString().includes("Flashing successfully done")) {
+              flashSuccess = true;
+            }
+            if (data.toString().includes("Setting serial number"))
+            {
+              powerManager.TRMRelay_OFF(ignitionPort, childProcess);
+              powerManager.TRMRelay_OFF(powerPort, childProcess);
+              powerManager.TRMRelay_ON(modeSwitchPort, childProcess);
+              powerManager.TRMRelay_ON(powerPort, childProcess);
+              powerManager.TRMRelay_ON(ignitionPort, childProcess);
+            }
+          });
+          childFlash.on("exit", function () {
+            powerManager.TRMRelay_ON(modeSwitchPort, childProcess);
+            if(!patch_file.includes("Linux"))
+            {
+              powerManager.TRMRelay_OFF(ignitionPort, childProcess);
+              powerManager.TRMRelay_OFF(powerPort, childProcess);
+              powerManager.TRMRelay_ON(powerPort, childProcess);
+              powerManager.TRMRelay_ON(ignitionPort, childProcess);
+            }
+            if (flashSuccess) {
+                console.log("Update successfully done");
+                socket.emit("updateMessage", { message: "Update successfully done" });
+                brokenDevice[projectIndex] = 0;
+              }
+              else {
+                socket.emit("updateMessage", { message: "Update not successfull" });
+                brokenDevice[projectIndex] = 1;
+              }
+            socket.emit("projectMessageFromServer", { message: "UpdateSelectVersionMenu" });
+          });
+        }
+        else if (data.imageType == "nad") {
+          if (projectName == "hw8") {
+            //NAD UPDATE
+            powerManager.TRMRelay_OFF(powerPort, childProcess);
+            powerManager.TRMRelay_OFF(ignitionPort, childProcess);
+            powerManager.TRMRelay_OFF(modeSwitchPort, childProcess);
+            powerManager.TRMRelay_ON(powerPort, childProcess);
+            powerManager.TRMRelay_ON(ignitionPort, childProcess);
+
+            console.log("Attempting to flash passthrough Image");
+            let lastSentData = "";
+            let flashSuccess = false;
+            childFlash = require("child_process").spawn("./public/scripts/uuuFlash.sh", ["public/traton_imx_images/FlashLinuxAndStartNadDownloadMode.zip", flashPort]);
+            childFlash.stdout.on("data", function (data) {
+              let output = data.toString().replace(/[^a-z0-9!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?\n ]|\[1F|\[93m|\[92m|\[0m|\[\?25l|/gi, '').slice(0, 200).trim();
+              if (output.slice(-1) != '\n')
+              output += '\n';
+              if (output != lastSentData && output.length > 1)
+                socket.emit("updateMessage", { message: output });
+              lastSentData = output;
+              if (data.toString().includes("Flashing successfully done")) {
+                flashSuccess = true;
+              }
+            });
+            childFlash.on("exit", function () {
+              powerManager.TRMRelay_ON(modeSwitchPort, childProcess);
+              if (flashSuccess) {
+                  flashNAD(patch_file, workDir, flashPort, "hw8", socket, projectIndex, powerPort, ignitionPort, adbPort, adbServerPort)
+                }
+                else {
+                  powerManager.TRMRelay_OFF(ignitionPort, childProcess);
+                  powerManager.TRMRelay_OFF(powerPort, childProcess);
+                  powerManager.TRMRelay_ON(powerPort, childProcess);
+                  powerManager.TRMRelay_ON(ignitionPort, childProcess);
+                  socket.emit("updateMessage", { message: "Update not successfull" });
+                  brokenDevice[projectIndex] = 1;
+                  socket.emit("projectMessageFromServer", { message: "UpdateSelectVersionMenu" });
+                }
+            });
+          }
+          else if (projectName == "pcm3")
+          {
+            powerManager.TRMRelay_OFF(powerPort, childProcess);
+            powerManager.TRMRelay_OFF(ignitionPort, childProcess);
+            powerManager.TRMRelay_ON(modeSwitchPort, childProcess);
+            powerManager.TRMRelay_ON(powerPort, childProcess);
+            powerManager.TRMRelay_ON(ignitionPort, childProcess);
+            socket.emit("updateMessage", { message: "Attemting to flash NAD\n" });
+            flashNAD(patch_file, workDir, flashPort, "pcm3", socket, projectIndex, powerPort, ignitionPort, adbPort, adbServerPort)
+          }
+          else {
+            var LeapQuickUpdateFolder = cale.toString() + "/delivery/tools/quickupdateclient/";
+            var LeapQuickUpdate = cale.toString() + "/delivery/tools/quickupdateclient/LeapQuickUpdate.jar";
+            console.log("Leap QU:", LeapQuickUpdate);
+    
+            if (!data.trm30State || !data.trm15State) {
+              var childProcess = powerManager.getRelayAppProcess();
+              powerManager.TRMRelay_ON(configProjectFile.config[projectIndex].relayBoardTRM30ID, childProcess);
+              powerManager.TRMRelay_ON(configProjectFile.config[projectIndex].relayBoardTRM15ID, childProcess);
+              var bootDelay = configProjectFile.config[projectIndex].BootDelay;
+            } else {
+              var bootDelay = 0;
+            }
+
+            childQU = require("child_process").spawn("./public/scripts/doQuickUpdate.sh", [LeapQuickUpdateFolder, LeapQuickUpdate, patch_file, ip_actual, bootDelay]);
+            childQU.stdout.on("data", function (data) {
+              var quickUpdateInfoRow = data.toString().split("\n");
+              if (data.toString() != "*") {
+                for (var i = 0; i < quickUpdateInfoRow.length; i++) {
+                  if (quickUpdateInfoRow[i] == "Quickupdate not successfull!") {
+                    console.log("QUICK UPDATE NOT SUCCESSFUL");
+                    quickUpdateFinished = true;
+                    brokenDevice[projectIndex] = 1;
+                  }
+                  if (quickUpdateInfoRow[i] == "Quickupdate successfully done!") {
+                    console.log("QUICK UPDATE SUCCESSFUL");
+                    quickUpdateFinished = true;
+                    brokenDevice[projectIndex] = 0;
+                  }
+                }
+                console.log(data.toString());
+                socket.emit("updateMessage", { message: data.toString() });
+              }
+            });
+            childQU.on("exit", function () {
+              if (!quickUpdateFinished) {
+                socket.emit("updateMessage", { message: "Quickupdate finished!" });
+              }
+              socket.emit("projectMessageFromServer", { message: "UpdateSelectVersionMenu" });
+            });
+          }
+        } else {
+          socket.emit("projectMessageFromServer", { message: "UpdateSelectVersionMenu" });
+        }
+        break;
+      //checks for the development image at the specific path
+      case "checkforDevVersion":
+        var projectName = data.projName;
+        var projectIndex = projectIndices[data.projID];
+        var cale = projectsPath + projectName + '/' + data.quickUpdateVersion.toString();
+        if (projectName == "pcm3") {
+          var patch_file = cale.toString() + "/develop/uuu-flash-spinor-emmc.zip";
+        }
+        else if (projectName == "hw8"){
+          var patch_file = cale.toString() + "/hw8/develop";
+        }
+        else {
+          var patch_file = cale.toString() + "/develop/" + projectName + "_" + data.quickUpdateVersion.toString() + "_quickupdatePatch_develop";
+        }
+        if (!fs.existsSync(patch_file)) {
+          socket.emit("searchForDev", { message: "False" });
+        }
+        else if (fs.existsSync(patch_file)) {
+          socket.emit("searchForDev", { message: "True" });
+        }
+        break;
+      //when user wants to release project even if time is not finished
+      case "releaseProject":
+        console.log("ReleaseProject: " + data.projName + "-id-" + data.projID + ", " + data.username + ", force=" + data.force);
+        var projectIndex = projectIndices[data.projID];
+        runTimer[projectIndex] = false;
+        totalElapsedTime[projectIndex] = 0;
+        timeFinished[projectIndex] = true;
+        timerProj[projectIndex].stop();
+        timerProj[projectIndex].reset(0);
+
+        closeProject(socketForProject[projectIndex]);
+
+        //adding the bootDelay to the quickupdateTime
+        if (!data.trm30State || !data.trm15State) {
+          var bootDelay = configProjectFile.config[projectIndex].BootDelay;
+        } else {
+          var bootDelay = 0;
+        }
+
+        timeElapsed[projectIndex] = 0;
+        myPrjName[data.projID] = "";
+        myDeviceIP[data.projID] = "";
+
+        if (data.force) {
+          configProjectFile.config[projectIndex].LockedBy = "";
+          configProjectFile.config[projectIndex].LockedFor = "0";
+
+          // brokenDevice[projectIndex] = 0;
+          timeForProject[projectIndex] = 0;
+          io.sockets.emit("projectMessageFromServer",
+          {
+            message: "quickUpdateInProgress",
+            projName: data.projName,
+            projID: data.projID,
+            username: data.username,
+            session: sessions[projectIndex],
+            hardware: configProjectFile.config[projectIndex].HW,
+            software: configProjectFile.config[projectIndex].SW
+          });
+        } else {
+          configProjectFile.config[projectIndex].LockedBy = "QuickUpdate";
+          configProjectFile.config[projectIndex].LockedFor = "0";
+          timeForProject[projectIndex] = configProjectFile.config[projectIndex].QuickUpdateTime + bootDelay;
+          timeProject[projectIndex] = configProjectFile.config[projectIndex].QuickUpdateTime + bootDelay;
+          
+          sendProjectState("quickUpdateInProgress", data.projID, data.projName, data.username, configProjectFile.config[projectIndex].QuickUpdateTime, sessions[projectIndex], configProjectFile.config[projectIndex].HW, configProjectFile.config[projectIndex].SW);
+          
+          timerProj[projectIndex].start();
+          runTimer[projectIndex] = true;
+          timeFinished[projectIndex] = false;
+        }
+        saveConfigFile();
+        io.sockets.emit("addNewConfigMessageFromServer", { message: "reloadPage" });
+
+        break;
+      case "startRecordingFirstSerial":
+        var projectIndex = projectIndices[data.projID];
+        console.log("Write: startRecordingFirstSerial");
+        simpleFileWriteSync("userSpace/" + data.username + '/' + data.projName + '/' + configProjectFile.config[projectIndex].deviceIPAddr + "/firstSerial/" + "loggingOption.txt", '1');
+
+        break;
+
+      case "startRecordingSecondSerial":
+        var projectIndex = projectIndices[data.projID];
+        console.log("Write: startRecordingSecondSerial");
+        simpleFileWriteSync("userSpace/" + data.username + '/' + data.projName + '/' + configProjectFile.config[projectIndex].deviceIPAddr + "/secondSerial/" + "loggingOption.txt", '1');
+
+        break;
+
+      case "stopRecordingFirstSerial":
+        var projectIndex = projectIndices[data.projID];
+        simpleFileWriteSync("userSpace/" + data.username + '/' + data.projName + '/' + configProjectFile.config[projectIndex].deviceIPAddr + "/firstSerial/" + "loggingOption.txt", '0');
+        break;
+
+      case "stopRecordingSecondSerial":
+        var projectIndex = projectIndices[data.projID];
+        simpleFileWriteSync("userSpace/" + data.username + '/' + data.projName + '/' + configProjectFile.config[projectIndex].deviceIPAddr + "/secondSerial/" + "loggingOption.txt", '0');
+        break;
+
+      case "checkSerialLogsAvailability":
+        var projectIndex = projectIndices[data.projID];
+        var pathToLogs = "userSpace/" + data.username + '/' + data.projName + '/' + configProjectFile.config[projectIndex].deviceIPAddr + "/firstSerial/";
+        var pathToLogsSecond = "userSpace/" + data.username + '/' + data.projName + '/' + configProjectFile.config[projectIndex].deviceIPAddr + "/secondSerial/";
+        console.log(pathToLogs);
+        console.log(pathToLogsSecond);
+        var serialLogsAvailable = getSerialLogsFileNames(pathToLogs, [".txt"]).slice(1);
+        var serialLogsAvailableSecond = getSerialLogsFileNames(pathToLogsSecond, [".txt"]).slice(1);
+        console.log(serialLogsAvailable);
+        console.log(serialLogsAvailableSecond);
+        var logSize = 0;
+        var logSizeSecond = 0;
+        for (var i in serialLogsAvailable) {
+          const stats = fs.statSync(serialLogsAvailable[i]);
+          const fileSizeInBytes = stats.size;
+          if (fileSizeInBytes != 0) {
+            logSize = 1;
+            break;
+          }
+        }
+
+        for (var i in serialLogsAvailableSecond) {
+          const stats = fs.statSync(serialLogsAvailableSecond[i]);
+          const fileSizeInBytes = stats.size;
+          if (fileSizeInBytes != 0) {
+            logSizeSecond = 1;
+            break;
+          }
+        }
+
+        if (serialLogsAvailable && logSize != 0) {
+          socket.emit("projectMessageFromServer", { message: "firstSerialLogsAvailable" });
+        }
+        else {
+          socket.emit("projectMessageFromServer", { message: "firstSerialLogsNotAvailable" });
+        }
+
+        if (serialLogsAvailableSecond && logSizeSecond != 0) {
+          socket.emit("projectMessageFromServer", { message: "secondSerialLogsAvailable" });
+        }
+        else {
+          socket.emit("projectMessageFromServer", { message: "secondSerialLogsNotAvailable" });
+        }
+        break;
+
+      case "checkRecordingState":
+        var projectIndex = projectIndices[data.projID];
+        var loggingState = simpleReadFileSync("userSpace/" + data.username + '/' + data.projName + '/' + configProjectFile.config[projectIndex].deviceIPAddr + "/firstSerial/" + "loggingOption.txt");
+        if (loggingState == 1) {
+          socket.emit("projectMessageFromServer", { message: "recordingStartedFirstSerial" });
+        }
+        else {
+          socket.emit("projectMessageFromServer", { message: "recordingNotStartedFirstSerial" });
+        }
+        var loggingState = simpleReadFileSync("userSpace/" + data.username + '/' + data.projName + '/' + configProjectFile.config[projectIndex].deviceIPAddr + "/secondSerial/" + "loggingOption.txt");
+        if (loggingState == 1) {
+          socket.emit("projectMessageFromServer", { message: "recordingStartedSecondSerial" });
+        }
+        else {
+          socket.emit("projectMessageFromServer", { message: "recordingNotStartedSecondSerial" });
+        }
+        break;
+      default:
+        console.log("Other case");
+    }
+  });
+
+  //messages received from ClientPage
+  socket.on("messageFromClient", function (data) {
+    switch (data.message) {
+      //when user wants to logout server has to close all instances of that user
+      //server checks which users from the auth module are active
+      case "checkIfLogged":
+        if (loggedInUsers[data.username] == false) {
+          if (childs[socket.id]) {
+            console.log("OK")
+            kill(socket.id);
+            killProcessForSocket(socket.id);
+          }
+          socket.emit("clientMessageFromServer", { message: "close_socket" });
+        }
+        break;
+      //page requests server to verify if project is already locked in order to let the user select or not time
+      case "getIsLocked":
+        var projectIndex = findProject(data.projID);
+        //var projectIndex = projectIndices[data.projName];
+        socket.emit("clientMessageFromServer", { message: "receiveIsLocked", LockedBy: configProjectFile.config[projectIndex].LockedBy, projName: data.projName, session: sessions[projectIndex], projID: data.projID, hardware: configProjectFile.config[projectIndex].HW });
+        break;
+      //client Page requests data from server in order to see which projects are locked
+      //and restrict access to project
+      case "getConfigFileData":
+        for (var i = 0; i < configProjectFile.config.length; i++) {
+          var lockedBy = configProjectFile.config[i].LockedBy;
+          if (configProjectFile.config[i].LockedBy === "") {
+            //if project is not locked by anybody, server sends data to client Page
+            //the client Page will know to enable button
+            socket.emit("clientMessageFromServer",
+              {
+                message: "receiveConfigFileData",
+                projName: configProjectFile.config[i].projName,
+                projID: configProjectFile.config[i].projID,
+                session: sessions[i],
+                command: 1,
+                hardware: configProjectFile.config[i].HW,
+                software: configProjectFile.config[i].SW
+              });
+          }
+          else {
+            var usernameLocked;
+            if (lockedBy.indexOf("BROKEN-DEVICE") > -1) {
+              //lockedBy contains a substring of BROKEN-DEVICE and is either taken by user or free to be taken by admin
+              var array_lockedBy = lockedBy.split(',');
+              usernameLocked = array_lockedBy[0]; // username could be BROKEN-DEVICE or user id(uid)
+            }
+            else {
+              usernameLocked = configProjectFile.config[i].LockedBy;
+            }
+            if (usernameLocked === "BROKEN-DEVICE") {
+              socket.emit("clientMessageFromServer",
+                {
+                  message: "receiveConfigFileData",
+                  projName: configProjectFile.config[i].projName,
+                  projID: configProjectFile.config[i].projID,
+                  session: sessions[i],
+                  command: 4,
+                  hardware: configProjectFile.config[i].HW
+                });
+            }
+            else {
+              //if projects is locked by any user, server has to send data about who locked the
+              //project and how much time will the project be locked
+              var hours = floor(timeProject[i] / 3600);
+              var minutes = floor((timeProject[i] - hours * 3600) / 60);
+              if (usernameLocked === data.username) {
+                socket.emit("clientMessageFromServer",
+                  {
+                    message: "receiveConfigFileData",
+                    projName: configProjectFile.config[i].projName,
+                    projID: configProjectFile.config[i].projID,
+                    session: configProjectFile.config[i].Session,
+                    command: 2,
+                    username: configProjectFile.config[i].LockedBy,
+                    hours: hours,
+                    minutes: minutes,
+                    hardware: configProjectFile.config[i].HW,
+                    software: configProjectFile.config[i].SW
+                  });
+              }
+              else {
+                socket.emit("clientMessageFromServer",
+                  {
+                    message: "receiveConfigFileData",
+                    projName: configProjectFile.config[i].projName,
+                    projID: configProjectFile.config[i].projID,
+                    session: configProjectFile.config[i].Session,
+                    command: 3,
+                    username: configProjectFile.config[i].LockedBy,
+                    hours: hours,
+                    minutes: minutes,
+                    hardware: configProjectFile.config[i].HW,
+                    software: configProjectFile.config[i].SW
+                  });
+              }
+            }
+
+          }
+        }
+        break;
+      //client page wants to know which options of time can the user choose
+      case "getTimeForProjects":
+        for (var i = 0; i < timeForProjConfig.time.length; i++) {
+          socket.emit("clientMessageFromServer", { message: "receiveTimeForProjects", time: timeForProjConfig.time[i].time, index: i });
+        }
+        break;
+      case "verifyIfAdmin":
+        if (userAdmin[data.username]) {
+          socket.emit("clientMessageFromServer", { message: "verifyIfAdmin", admin: true });
+        }
+        break;
+      case "changePassword":
+        var hashPass = crypto.createHash("sha256").update(data.newPassword).digest("hex");
+        for (let i = 0; i < loginFile.users.length; i++) {
+          if (loginFile.users[i].user === data.username) { //verify user
+            loginFile.users[i].password = hashPass;
+            fs.writeFile("./auth/remote_passw", JSON.stringify(loginFile, null, 6), (err) => { if (err) throw err });
+            var sendMail = require("child_process");
+            sendMail.exec("./public/scripts/sendmail.sh " + "changedPass" + ' ' + loginFile.users[i].mail,
+              function (error, stdout, stderr) {
+                if (error != null) {
+                  console.log("error" + error);
+                  console.log("STDERR = " + stderr);
+                  console.log("STDOUT = " + stdout);
+                }
+              });
+          }
+        }
+        break;
+      case "firstLoginDone":
+        for (let i = 0; i < loginFile.users.length; i++) {
+          if (loginFile.users[i].user === data.username) { //verify user
+            loginFile.users[i].firstLogin = false;
+            fs.writeFile("./auth/remote_passw", JSON.stringify(loginFile, null, 6), (err) => { if (err) throw err });
+          }
+        }
+        break;
+    }
+  });
+
+  socket.on("messageFromAddNewConfig", function (data) {
+    switch (data.message) {
+      case "checkIfLogged":
+        if (loggedInUsers[data.username] == false) {
+          socket.emit("addNewConfigMessageFromServer", { message: "close_socket" });
+        }
+        break;
+      case "checkDevice":
+        let projIndex = findProject(data.projID);//// TODO:  LINE UNDERNEATH
+        var lockedBy = splitLockedBy(configProjectFile.config[projIndex].LockedBy);
+        socket.emit("addNewConfigMessageFromServer", {
+          message: "checkDevice",
+          relayBoardTRM30ID: configProjectFile.config[projIndex].relayBoardTRM30ID,
+          relayBoardTRM15ID: configProjectFile.config[projIndex].relayBoardTRM15ID,
+          projName: configProjectFile.config[projIndex].projName,
+          username: lockedBy,
+          projID: data.projID
+        });
+        break;
+      case "releaseProject":
+        console.log("ReleaseProject:" + data.projName + "-id-" + data.projID + "," + data.username);
+        let projectIndex = findProject(data.projID);
+        runTimer[projectIndex] = false;
+        totalElapsedTime[projectIndex] = 0;
+        timeFinished[projectIndex] = true;
+        timerProj[projectIndex].stop();
+        timerProj[projectIndex].reset(0);
+
+        closeProject(socketForProject[projectIndex]);
+
+        configProjectFile.config[projectIndex].LockedBy = "QuickUpdate";
+        configProjectFile.config[projectIndex].LockedFor = "0"; //new code
+        saveConfigFile();
+
+        timeForProject[projectIndex] = configProjectFile.config[projectIndex].QuickUpdateTime + configProjectFile.config[projectIndex].BootDelay;
+        timeProject[projectIndex] = configProjectFile.config[projectIndex].QuickUpdateTime + configProjectFile.config[projectIndex].BootDelay;
+        io.sockets.emit("projectMessageFromServer",
+          {
+            message: "disconnectedByAdmin",
+            projName: data.projName,
+            projID: data.projID,
+            username: data.username,
+            quickUpdateTime: configProjectFile.config[projectIndex].QuickUpdateTime / 60,
+            hardware: configProjectFile.config[projectIndex].HW
+          });
+        sendProjectState("quickUpdateInProgress", data.projID, data.projName, data.username, configProjectFile.config[projectIndex].QuickUpdateTime, sessions[projectIndex], configProjectFile.config[projectIndex].HW, configProjectFile.config[projectIndex].SW);
+        timeElapsed[projectIndex] = 0;
+        timerProj[projectIndex].start();
+        timeFinished[projectIndex] = false;
+        runTimer[projectIndex] = true;
+
+        io.sockets.emit("addNewConfigMessageFromServer", { message: "reloadPage" });
+        break;
+    }
+  });
+
+  //when socket disconnects it has to kill processes
+  socket.on("disconnect", function () {
+    if (childs[socket.id]) {
+      kill(socket.id);
+    }
+  });
+
+  // When a message is received, the clients username is retrieved and sent to the other people
+  socket.on("message", function (message) {
+    message = ent.encode(message);
+    socket.broadcast.emit("message", { username: socket.username, message: message });
+  });
+
+  socket.on("getStates", function (data) {
+    powerManager.TRMRelay_State(data.toggleValue);
+  });
+
+
+  socket.on("serverRequest", function (data) {
+
+    if (data.code == 1) {//addDevice
+      let verifiedID = false;
+      let idString = null;
+      do {
+        idString = randomString.generate(4);
+        verifiedID = verifyID(idString);
+        if (verifiedID) {
+          console.log("Generated ID is not repeating:" + idString);
+        }
+        else {
+          console.log("Generated ID already exists:" + idString);
+        }
+      } while (!verifiedID);
+      var leapVersion = "";
+      var childSWVersion = getSWVersionProcess(data.rowContent[5]);
+      childSWVersion.stdout.on("data", function (data) {
+        leapVersion = data.toString().slice(0, -1);
+      });
+
+      childSWVersion.on("exit", () => {
+        if (leapVersion === "Not available\n") {
+          leapVersion = leapVersion.slice(0, -1);
+        }
+        if (leapVersion === "") {
+          leapVersion = "Not available";
+        }
+        device = composeDevice(data.rowContent, idString, leapVersion, generatePort(6000, 7000), generatePort(6000, 7000), generatePort(6000, 7000), generatePort(6000, 7000), generatePort(5038, 5500));
+        generatedPorts = []
+        configProjectFile.config.push(device); //push the new device in the config array
+        saveConfigFile(); //update de config file
+        io.emit("getFromServer", { SW: device.SW, idString, user: data.user, code: 3 });
+        getAvailableSerialPorts();
+      });
+    }
+    if (data.code == 2) { //updateDevice
+      console.log("Update device");
+      //the second parameter of composeDevice is the random generated string which can be null...
+      //because the string value is stored in device variable, but is not stored in the config file
+      device = composeDevice(data.rowContent, data.id);
+      for (var i = 0; i < configProjectFile.config.length; i++) //search the edited device and replace the modified values
+      {
+        if (configProjectFile.config[i].projID == data.id) {
+          configProjectFile.config[i].projName = device.projName;
+          configProjectFile.config[i].serialConnection1 = device.serialConnection1;
+          configProjectFile.config[i].serialConnection2 = device.serialConnection2;
+          configProjectFile.config[i].HW = device.HW;
+          configProjectFile.config[i].deviceIPAddr = device.deviceIPAddr;
+          configProjectFile.config[i].relayBoardTRM30ID = device.relayBoardTRM30ID;
+          configProjectFile.config[i].relayBoardTRM15ID = device.relayBoardTRM15ID;
+          configProjectFile.config[i].modeSwitchPort = device.modeSwitchPort;
+          configProjectFile.config[i].flashPort = device.flashPort;
+          configProjectFile.config[i].keyPath = projectsKeyPath + device.projName + "/ssh/leap-" + device.projName + "-ssh-root";
+          configProjectFile.config[i].pin = device.pin;
+          configProjectFile.config[i].puk = device.puk;
+          configProjectFile.config[i].simnr = device.simnr;
+          configProjectFile.config[i].serialNumber = device.serialNumber;
+          configProjectFile.config[i].adbPort = device.adbPort;
+          configProjectFile.config[i].ethAdapterPort = device.ethAdapterPort;
+          break;
+        }
+      }
+
+      saveConfigFile(); //update the config file
+      getAvailableSerialPorts();
+
+      io.emit("getFromServer", { device, user: data.user, code: 4 });
+    }
+    if (data.code == 3) {//deleteDevice
+      console.log("DELETE DEVICE");
+      for (var i = 0; i < configProjectFile.config.length; i++) {
+        if (configProjectFile.config[i].projID == data.id) {
+          configProjectFile.config.splice(i, 1);  //delete the i element from the first array from the config file
+          saveConfigFile();
+          getAvailableSerialPorts();
+          break;
+        }
+      }
+      io.emit("getFromServer", { id: data.id, code: 5 });
+      getAvailableSerialPorts();
+    }
+    if (data.code == 4) {//returnProjects
+      getProjects();
+    }
+    if (data.code == 5) { //getAvailableSerialPorts
+      getAvailableSerialPorts();
+    }
+    if (data.code == 6) { //editDevice
+      //gets the index of currently being edited row/device
+      for (var i = 0; i < configProjectFile.config.length; i++) {
+        if (configProjectFile.config[i].projID === data.id) {
+          index = i;
+          break;
+        }
+      }
+      console.log("EDIT DEVICE ID = " + index);
+    }
+  });
+});
+
+function verifyID(idString) {
+  for (var i = 0; i < configProjectFile.config.length; i++) {
+    if (configProjectFile.config[i].projID == idString)
+      return false;
+  }
+  return true;
+}
+
+function checkPort(port) {
+  for (var i = 0; i < configProjectFile.config.length; i++) {
+    if (configProjectFile.config[i].serialFWonPort1 == port ||
+        configProjectFile.config[i].serialFWonPort2 == port ||
+        configProjectFile.config[i].SHHFWonPort == port ||
+        configProjectFile.config[i].VNCFWPort == port ||
+        configProjectFile.config[i].adbServerPort == port ||
+        generatedPorts.includes(port))
+      return false;
+  }
+  return true;
+}
+
+//this function is called when the time for project expired
+function closeProject(socketID) {
+  if (childs[socketID]) {
+    console.log("Close Project");
+    var projectIndex = childs[socketID].ProjectIndex;
+    configProjectFile.config[projectIndex].LockedBy = "";
+    usersSockets[socketID] = null;
+    kill(socketID);
+    killProcessForSocket(socketID);
+    childs[socketID] = null;
+    socketForProject[projectIndex] = null;
+    saveConfigFile();
+  }
+}
+
+//this function is called whenever the processes have to be closed because user leaves the
+//page and all its resources must be released
+function kill(socketID) {
+  if (childs[socketID]) {
+    killPID(childs[socketID].serialChildExec1.pid);
+    killPID(childs[socketID].serialChildExec2.pid);
+    killPID(childs[socketID].sshChildExec.pid);
+    killPID(childs[socketID].vncChildExec.pid);
+    
+    killSerial(childs[socketID].fileManagerPort);
+  }
+}
+
+function killProcessForSocket(socketID) {
+  if (childs[socketID]) {
+    let projectIndex = childs[socketID].ProjectIndex;
+    killProcessOnPort(configProjectFile.config[projectIndex].serialFWonPort1);
+    killProcessOnPort(configProjectFile.config[projectIndex].serialFWonPort2);
+    killProcessOnPort(configProjectFile.config[projectIndex].SHHFWonPort);
+    killProcessOnPort(configProjectFile.config[projectIndex].VNCFWPort);
+  }
+}
+
+//this function is called only when the server is closed in order to release all projects
+function closeAllProjects() {
+  for (var i = 0; i < configProjectFile.config.length; i++) {
+    configProjectFile.config[i].LockedBy = "";
+    configProjectFile.config[i].LockedFor = "0";
+  }
+}
+
+function getAvailableSerialPorts() {
+  var selectedProjectArray = [];
+  var allPorts = [];
+  availablePorts = [];
+  var childPP = require("child_process").spawn(deviceConnectionScript);
+  childPP.stdout.on("data", function (data) {
+    var mes = data.toString();
+    allPorts = mes.split(" ");
+    var l = allPorts.length;
+    allPorts[l - 1] = allPorts[l - 1].slice(0, -1);
+    for (var i = 0; i < configProjectFile.config.length; i++) {
+      selectedProjectArray.push(configProjectFile.config[i].serialConnection1);
+      selectedProjectArray.push(configProjectFile.config[i].serialConnection2);
+    }
+    var sw;
+    for (var i = 0; i < allPorts.length; i++) {
+      sw = 0;
+      for (var j = 0; j < selectedProjectArray.length; j++) {
+        if (allPorts[i] == selectedProjectArray[j]) {
+          sw = 1;
+          break;
+        }
+      }
+      if (sw == 0) {
+        console.log("availablePorts[" + availablePorts.length + "] = " + allPorts[i]);
+        availablePorts.push(allPorts[i]);
+      }
+    }
+    io.emit("getFromServer", { availablePorts, code: 2 });
+  });
+}
+
+function generatePort(startValue, lastValue) {
+  let port = Math.floor(Math.random() * (Math.floor(lastValue) - Math.ceil(startValue) + 1)) + Math.ceil(startValue);
+  while (!checkPort(port)) {
+    port = Math.floor(Math.random() * (Math.floor(lastValue) - Math.ceil(startValue) + 1)) + Math.ceil(startValue);
+  }
+  generatedPorts.push(port)
+  return port.toString()
+}
+
+//function for composing a device in order to add/update it to the config file
+function composeDevice(rowContent, idString, leapVersion, serialFWonPort1, serialFWonPort2, SHHFWonPort, VNCFWPort, adbServerPort) {
+  var keyP = projectsKeyPath + rowContent[0] + "/ssh/leap-" + rowContent[0] + "-ssh-root";
+  let device = {
+    projName: rowContent[0].replace("<br>",""),
+    SW: leapVersion,
+    projID: idString,
+    serialConnection1: rowContent[1].replace("<br>",""),
+    serialConnection2: rowContent[2].replace("<br>",""),
+    serialFWonPort1: serialFWonPort1,
+    serialFWonPort2: serialFWonPort2,
+    HW: rowContent[3].replace("<br>",""),
+    deviceIPAddr: rowContent[4].replace("<br>",""),
+    SHHFWonPort: SHHFWonPort,
+    relayBoardTRM30ID: rowContent[5].replace("<br>",""),
+    relayBoardTRM15ID: rowContent[6].replace("<br>",""),
+    VNCFWPort: VNCFWPort,
+    modeSwitchPort: rowContent[7].replace("<br>",""),
+    flashPort: rowContent[8].replace("<br>",""),
+    pin: rowContent[9].replace("<br>",""),
+    puk: rowContent[10].replace("<br>",""),
+    simnr: rowContent[11].replace("<br>",""),
+    serialNumber: rowContent[12].replace("<br>",""),
+    adbServerPort: adbServerPort,
+    adbPort: rowContent[13].replace("<br>",""),
+    ethAdapterPort: rowContent[14].replace("<br>",""),
+    keyPath: keyP,
+    Locked: '0',
+    LockedBy: '',
+    QuickUpdateTime: 1080,
+    BootDelay: 30
+  };
+  return device;
+}
+
+function getSWVersionProcess(data) {
+  var spawn = require("child_process").spawn;
+  var childSWVersion = spawn("bash", ["./public/scripts/getSoftwareVersion.sh", data], { detached: true });
+  var timeout = setTimeout(() => {
+    console.log("SW script Timeout");
+    try {
+      process.kill(-childSWVersion.pid, "SIGKILL");
+    } catch (e) {
+      console.log("Cannot kill SW script");
+    }
+  }, 2 * 1000);
+  childSWVersion.on("exit", () => { clearTimeout(timeout); });
+  return childSWVersion;
+}
+
+//function for saving config json file whenever a change is made
+function saveConfigFile() {
+  fs.writeFile("./public/config/persistent/config.json", JSON.stringify(configProjectFile, null, 9), function (err) {
+    if (err) {
+      console.log("Error at saveConfigFile:" + err);
+      return;
+    }
+    fs.writeFile("./public/config/persistent/config_backup.json", JSON.stringify(configProjectFile, null, 9), function (err) { });
+  });
+}
+
+function saveUserSerialDownloadFile(username, prjName, deviceIP, projectIndex, serialID) {
+  if (serialID == "firstSerial")
+    fs.writeFileSync("userSpace/" + username + '/' + prjName + '/' + deviceIP + '/' + serialID + '/' + "userSerialDownload.json", JSON.stringify(userDownloadFile[projectIndex], null, 9), function (err) {
+      if (err) return console.log(err);
+    });
+  if (serialID == "secondSerial")
+    fs.writeFileSync("userSpace/" + username + '/' + prjName + '/' + deviceIP + '/' + serialID + '/' + "userSerialDownload.json", JSON.stringify(userDownloadFileSecond[projectIndex], null, 9), function (err) {
+      if (err) return console.log(err);
+    });
+}
+
+//find project index from project name
+function findProject(projID) {
+  var projectIndex;
+  for (var i = 0; i < configProjectFile.config.length; i++) {
+    if (configProjectFile.config[i].projID === projID) {
+      projectIndex = i;
+      break;
+    }
+  }
+  return projectIndex;
+}
+
+//function for killing process with certain PID
+function killPID(pid) {
+  var kill_PID = require("child_process");
+  console.log("Trying to kill PID " + pid);
+  kill_PID.exec("sudo killPid.sh " + pid,
+    function (error, stdout, stderr) {
+      if (error != null) {
+        //console.log("exec error KILLING PID Child" + error);
+        console.log("Nothing to kill");
+      }
+    });
+}
+
+//function for killing process on certain port(serial)
+function killProcessOnPort(port) {
+  var killChild = require("child_process");
+  killChild.exec("sudo killPort.sh " + port,
+      function (error, stdout, stderr) {
+        if (error != null) {
+          //console.log("exec error killChild " + error);
+          console.log("Tried to kill port " + port + ", nothing to kill");
+        }
+        else {
+          console.log("Tried to kill port " + port + ", success");
+        }
+    });
+  sleep(500);
+
+}
+
+function killSerial(serialPort) {
+  var killChild = require("child_process");
+  killChild.spawn("fuser", ["-k", serialPort + "/tcp"]);
+  sleep(500);
+}
+
+function sleep(milliseconds) {
+  var start = new Date().getTime();
+  for (var i = 0; i < 1e7; i++) {
+    if ((new Date().getTime() - start) > milliseconds) {
+      break;
+    }
+  }
+}
+
+function getProjectNewestVersion(projName, callback) { //return the newest version of the project(includes dev versions)
+  const exec = require("child_process").exec;
+  var version;
+
+  var child = exec("node ./Minerva_modules/version_sort/lib/sort.js " + projectsPath + ' ' + projName,
+    (error, stdout, stderr) => {
+      version = `${stdout}`;
+      callback(version);
+      if (error !== null) {
+        console.log(`exec error: ${error}`);
+      }
+    });
+}
+
+function getProjectReleaseVersions(projName) { //return the sorted versions of the project
+  var fileArray = [];
+  var sortedVersionArray;
+  const quickUpdateFolder = projectsPath + projName;
+  if (fs.existsSync(quickUpdateFolder)) {
+    fs.readdirSync(quickUpdateFolder).forEach(file => {
+      if(projName!="hw8" ||  (file.split(".").length - 1) != 3)
+        fileArray.push(file);
+    })
+
+    var branch;
+
+    for (var key in branchesConfigFile) {
+      if (key == projName)
+        branch = branchesConfigFile[key];
+    }
+
+    sortedVersionArray = versionSort.sortArray(fileArray, branch);
+
+    return sortedVersionArray;
+  }
+  else {
+    console.log("FOLDER IS NOT HERE");
+    return "";
+  }
+}
+
+function getCustomImages(projName, username, deviceIPAddr) { //return the sorted versions of the project
+  var fileArray = [];
+  let quickUpdateFolder = "userSpace/" + username + '/' + projName + '/' + deviceIPAddr + "/images";
+  let serverPath = "/mnt/servers"
+  if (fs.existsSync(quickUpdateFolder)) {
+    fs.readdirSync(quickUpdateFolder).forEach(file => {
+      if (file.split('.').pop() == "zip")
+        fileArray.push(file);
+    })
+
+    fs.readdirSync(serverPath).forEach(dir => {
+      fs.readdirSync(serverPath + "/" + dir).forEach(home => {
+        if (home == username){
+          fs.readdirSync(serverPath + "/" + dir + "/" + home).forEach(image => {
+            if (image.split('.').pop() == "zip")
+              fileArray.push(serverPath + "/" + dir + "/" + home + "/" + image);
+          })
+        }
+      })
+    })
+
+    return fileArray;
+  }
+  else {
+    console.log("FOLDER IS NOT HERE");
+    return "";
+  }
+}
+
+function getIMXImages(projName) { //return the sorted versions of the project
+  var fileArray = [];
+  let quickUpdateFolder = "";
+  if(projName == "hw8"){
+    quickUpdateFolder = "public/traton_imx_images";
+    if (fs.existsSync(quickUpdateFolder)) {
+      fs.readdirSync(quickUpdateFolder).forEach(file => {
+        if (file.split('.').pop() == "zip" && file!="FlashLinuxAndStartNadDownloadMode.zip")
+          fileArray.push(file);
+      })
+    }
+    else {
+      console.log("FOLDER IS NOT HERE");
+      return "";
+    }
+  }
+  else if(projName == "pcm3"){
+    quickUpdateFolder = projectsPath + projName;
+    if (fs.existsSync(quickUpdateFolder)) {
+      fs.readdirSync(quickUpdateFolder).forEach(file => {
+        if (fs.existsSync(quickUpdateFolder + "/" + file + "/build/uuu-flash-spinor-emmc.zip"))
+          fileArray.push(file);
+      })
+    }
+    else {
+      console.log("FOLDER IS NOT HERE");
+      return "";
+    }
+  }
+
+  fileArray = versionSort.sortArray(fileArray)
+  return fileArray;
+}
+
+function getProjects() {
+  var fileArray = [];
+  fs.readdirSync(projectsPath).forEach(file => {
+    var stats = fs.lstatSync(projectsPath + file);
+    if (stats.isDirectory()) {
+      fileArray.push(file);
+    }
+  });
+  io.emit("getFromServer", { fileArray, code: 1 });
+}
+
+function getListOfDirectoryNames(path) {
+  return fs.readdirSync(path).filter(function (file) {
+    return fs.statSync(path + '/' + file).isDirectory();
+  });
+}
+
+function getFilesFromDirectory(path) {
+  var files = [];
+  fs.readdirSync(path).forEach(file => {
+    files.push(file);
+  });
+  return files;
+}
+
+function sendProjectState(message, projID, project, username, quickUpdateTime, session, hardware, software) {
+  io.sockets.emit("projectMessageFromServer",
+  {
+    message: message,
+    projName: project,
+    projID: projID,
+    username: username,
+    session: session,
+    hardware: hardware,
+    software: software
+  });
+  io.sockets.emit("clientMessageFromServer",
+  {
+    message: message,
+    projName: project,
+    projID: projID,
+    username: username,
+    session: session,
+    quickUpdateTime: floor(quickUpdateTime / 60),
+    hardware: hardware,
+    software: software,
+  });
+  if(message == "quickUpdateInProgress")
+  startUpdate(projID, username);
+}
+
+function sendConvertedTime(timeElapsed, projectIndex, project, projID, broken_Device, username) {
+  if (timeElapsed % 60 === 0) {
+    timeElapsed = 0;
+    if (configProjectFile.config[projectIndex].LockedBy === "") {
+      timerProj[projectIndex].stop();
+    }
+    else {
+      timeProject[projectIndex] -= 60;
+      //here i can check the number of MB from serial logs and notify user
+      if (username != "QuickUpdate")
+      {
+        var notifyMBLimit = 0.8 * configProjectFile.genericProjectConfig.serialLogSize;
+
+        if (! userDownloadFile.hasOwnProperty("projectIndex"))
+          userDownloadFile[projectIndex] = new SelfReloadJSON("userSpace/" + username + '/' + configProjectFile.config[projectIndex].projName + '/' + configProjectFile.config[projectIndex].deviceIPAddr + "/firstSerial/" + "userSerialDownload.json");
+        if (userDownloadFile[projectIndex].numberOfMBtoDownload > notifyMBLimit) {
+          io.sockets.emit("projectMessageFromServer", { message: "notifyuserSpace", projName: project, projID: projID, userNotified: userDownloadFile[projectIndex].userNotified });
+          if (userDownloadFile[projectIndex].userNotified !== true) {
+            userDownloadFile[projectIndex].userNotified = true;
+          }
+          saveUserSerialDownloadFile(username, configProjectFile.config[projectIndex].projName, configProjectFile.config[projectIndex].deviceIPAddr, projectIndex, "firstSerial");
+        }
+
+        if (! userDownloadFileSecond.hasOwnProperty("projectIndex"))
+          userDownloadFileSecond[projectIndex] = new SelfReloadJSON("userSpace/" + username + '/' + configProjectFile.config[projectIndex].projName + '/' + configProjectFile.config[projectIndex].deviceIPAddr + "/secondSerial/" + "userSerialDownload.json");
+        if (userDownloadFileSecond[projectIndex].numberOfMBtoDownload > notifyMBLimit) {
+          io.sockets.emit("projectMessageFromServer", { message: "notifyuserSpace", projName: project, projID: projID, userNotified: userDownloadFileSecond[projectIndex].userNotified });
+          if (userDownloadFileSecond[projectIndex].userNotified !== true) {
+            userDownloadFileSecond[projectIndex].userNotified = true;
+          }
+          saveUserSerialDownloadFile(username, configProjectFile.config[projectIndex].projName, configProjectFile.config[projectIndex].deviceIPAddr, projectIndex, "secondSerial");
+        }
+
+        var data = convertTime(timeProject[projectIndex]);
+        io.sockets.emit("projectMessageFromServer", { message: "updateTime", projName: project, hours: data.hours, minutes: data.minutes, projID: projID, brokenDevice: broken_Device });
+        io.sockets.emit("clientMessageFromServer", { message: "updateTime", projName: project, username: configProjectFile.config[projectIndex].LockedBy, hours: data.hours, minutes: data.minutes, session: sessions[projectIndex], projID: projID, brokenDevice: broken_Device });      
+      }
+    }
+  }
+  return timeElapsed;
+}
+
+function convertTime(time) {
+  var hours = floor(time / 3600);
+  var minutes = floor((time - hours * 3600) / 60);
+  return {
+    hours: hours,
+    minutes: minutes
+  };
+}
+
+function launchFileManager() {
+  let fmServer = require("child_process").exec("cd file_manager ; node fileManager.js ");
+  
+  fmServer.on("error", function (err) {
+    console.log("File manager error => ", err);
+  });
+  
+  fmServer.stdout.on("data", function (data) {
+    data = data.toString().replace(/\r?\n|\r/g, " ");
+    console.log("FileManager:", data);
+  });
+  
+  fmServer.on("close", (code, signal) => {
+    if (code === null) {
+      console.log("FileManager:", `File Manager terminated due to receipt of signal ${signal}`);
+    } else {
+      //in case of a failure in File manager the server for it should be restarted
+      console.log("FileManager:", `File Manager terminated due to receipt of signal ${signal} with code ${code}`);
+      fmServer.removeAllListeners();
+      fmServer.unref();
+      
+      setTimeout(function () {
+        fmServer = launchFileManager();
+        console.log("New file manager server started with pid => " + fmServer.pid);
+      }, 500);
+    }
+    fmServer.kill("SIGINT");
+  });
+  
+  return fmServer;
+}
+
+function flashNAD(patch_file, workDir, flashPort, project, socket, projectIndex, powerPort, ignitionPort, adbPort, adbServerPort) {
+  console.log("Attempting to flash NAD");
+  let lastSentData = "";
+  let flashNADSuccess = false;
+  childFlash = require("child_process").spawn("./public/scripts/qdlFlash.sh", [patch_file, flashPort, workDir, project, adbPort, adbServerPort]);
+  childFlash.stdout.on("data", function (data) {
+    let output = data.toString().trim();
+    if (output.slice(-1) != '\n')
+      output += '\n';
+    if (output != lastSentData && output.length > 1)
+    socket.emit("updateMessage", { message: output });
+    console.log(output)
+    lastSentData = output;
+    if (data.toString().includes("Flashing successfully done")) {
+      flashNADSuccess = true;
+    }
+  });
+  childFlash.stderr.on("data", function (data) {
+    let output = data.toString().replace(/[^a-z0-9!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?\n ]|\[1F|\[93m|\[92m|\[0m|\[\?25l|/gi, '').slice(0, 200).trim();
+    if (output.slice(-1) != '\n')
+    output += '\n';
+    if (output != lastSentData && output.length > 1)
+      socket.emit("updateMessage", { message: output });
+    lastSentData = output;
+  });
+  childFlash.on("exit", function () {
+    if (flashNADSuccess) {
+        console.log("Update successfully done");
+        socket.emit("updateMessage", { message: "Update NAD successfully done\n" });
+        pushPers(patch_file, project, socket, projectIndex, powerPort, ignitionPort, adbPort, adbServerPort)
+      }
+      else {
+        socket.emit("updateMessage", { message: "Update not successfull" });
+        brokenDevice[projectIndex] = 1;
+        socket.emit("projectMessageFromServer", { message: "UpdateSelectVersionMenu" });
+      }
+  });
+}
+
+function pushPers(patch_file, project, socket, projectIndex, powerPort, ignitionPort, adbPort, adbServerPort) {
+  console.log("Attempting to push pers");
+  let lastSentData = "";
+  let flashSuccess = false;
+  childFlash = require("child_process").spawn("./public/scripts/pushPers.sh", [patch_file, adbPort, adbServerPort, project]);
+  childFlash.stderr.on("data", function (data) {
+    console.log(data.toString());
+  })
+  childFlash.stdout.on("data", function (data) {
+    let output = data.toString().replace(/[^a-z0-9!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?\n ]|\[1F|\[93m|\[92m|\[0m|\[\?25l|/gi, '').slice(0, 200).trim();
+    if (output.slice(-1) != '\n')
+    output += '\n';
+    if (output != lastSentData && output.length > 1)
+    socket.emit("updateMessage", { message: output });
+    lastSentData = output;
+    if (data.toString().includes("Rebooting...") && project == "pcm3") {
+      var childProcess = powerManager.getRelayAppProcess();
+      powerManager.TRMRelay_OFF(powerPort, childProcess);
+      powerManager.TRMRelay_OFF(ignitionPort, childProcess);
+      powerManager.TRMRelay_ON(ignitionPort, childProcess);
+      powerManager.TRMRelay_ON(powerPort, childProcess);
+    }
+    if (data.toString().includes("Installing pers successfully done")) {
+      flashSuccess = true;
+    }
+  });
+  childFlash.on("exit", function () {
+    if (flashSuccess) {
+      console.log("Pushing pers done");
+      socket.emit("updateMessage", { message: "Pushing pers done" });
+      brokenDevice[projectIndex] = 0;
+    }
+    else
+    {
+      socket.emit("updateMessage", { message: "Pushing pers not successfull" });
+      brokenDevice[projectIndex] = 1; 
+    }
+    socket.emit("projectMessageFromServer", { message: "UpdateSelectVersionMenu" });
+  });
+}
+
+var s = server.listen(configProjectFile.serverConfig.ServerPort, function () {
+  var host = s.address().address
+  var port = s.address().port
+  
+  console.log("Listening on %s/%s", host, port);
+  // starting the filemanager once
+  fmServer = launchFileManager();
+});
+updateAfterFail();
